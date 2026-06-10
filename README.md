@@ -47,18 +47,16 @@ The tool follows a simple lifecycle:
 ### Fetch phase
 
 * Loads configuration from `.env` / environment variables (`OSV_ECOSYSTEMS`, `OSV_DB_PATH`, `OSV_DATA_RETENTION_DAYS`).
-* For each ecosystem, reads the last processed cursor from `source_cursor` and fetches the ecosystem sitemap.
-* Extracts `(vulnerability ID, lastmod)` from the sitemap and keeps only entries newer than the cursor.
-* Fetches vulnerability details from `GET /v1/vulns/{id}` with rate limiting (10 req/s), retry-on-429, batches of 100, and bounded parallelism (5 concurrent).
-* If the OSV API returns 404 for an ID, records it as a tombstone.
+* Downloads the OSV unified `all.zip` (`https://osv-vulnerabilities.storage.googleapis.com/all.zip`). The previous ETag is sent as `If-None-Match`, so the server returns `304 Not Modified` and the download is skipped when nothing has changed.
+* Iterates the zip entry-by-entry. Records whose `modified` timestamp is not newer than the saved cursor are skipped. Records whose top-level `withdrawn` field is set are treated as deletions and removed from the local database.
+* For every remaining record, the `affected[*].ecosystem` list is intersected with `OSV_ECOSYSTEMS`; non-matching records are dropped. The rest are upserted into `vulnerability` and `affected` in a single transaction per record.
 * After the fetch completes, rows older than `OSV_DATA_RETENTION_DAYS` are deleted to keep the database bounded.
 
 ### Store phase
 
-* Persists data in SQLite (`OSV_DB_PATH`) using upserts for `vulnerability` and idempotent inserts for `affected`.
-* Tracks progress per ecosystem in `source_cursor` so subsequent runs only fetch newly modified entries.
-* Deletes vulnerabilities (and related `affected` rows) older than the retention cutoff during fetch to keep the DB size bounded.
-* Keeps `tombstone` and `reported_snapshot` tables for deleted IDs and diff reporting.
+* Persists data in SQLite (`OSV_DB_PATH`) using one combined upsert per record (`SaveVulnerabilityWithAffected`) that washes out the per-vuln affected set so shrinking upstream packages don't leak stale rows.
+* Tracks the unified-source state in one `source_cursor` row keyed `__unified__` (the `cursor` column is the highest processed `modified`, the `etag` column drives the next `If-None-Match`).
+* Diff reporting state lives in `report_watermark`, keyed per ecosystem and compared against an ingest-time `fetched_at` column.
 
 ### Report phase
 
@@ -73,9 +71,8 @@ The tool follows a simple lifecycle:
 
 Snapshot and diff reports are generated from the same stored data, but differ in how they compare the current state to past runs.
 
-* **Snapshot reports** include all vulnerabilities currently stored in the database
-* **Diff reports** include only vulnerabilities that are new or updated since the last diff run
-* Diff reports use `reported_snapshot` as the baseline and rebuild it on each run
+* **Snapshot reports** include all vulnerabilities currently stored in the database.
+* **Diff reports** include only vulnerabilities whose `fetched_at` strictly exceeds the per-ecosystem `report_watermark`, advancing the watermark after the file is written. An ecosystem-filtered diff run only touches that ecosystem's watermark, so subsequent runs against other ecosystems still start from their own baseline.
 
 ## Using the CLI directly
 
@@ -119,7 +116,7 @@ At minimum, `OSV_ECOSYSTEMS` must be set before running the fetch command.
 | `OSV_DB_PATH`             | SQLite database file                  | `./osv.db`                |
 | `OSV_DATA_RETENTION_DAYS` | Days of vulnerability data to keep    | `7`                       |
 
-Other operational parameters (API base URL, rate limit, concurrency, batch size, HTTP timeout) are compiled-in constants. See [docs/performance.md](docs/performance.md) for details.
+The unified `all.zip` URL and the canonical ecosystem allowlist URL are compiled-in constants. There is no per-request rate limiter, concurrency knob, or batch size — the fetch path is a single HTTP download. See [docs/performance.md](docs/performance.md) for the full cost profile.
 
 ## License
 

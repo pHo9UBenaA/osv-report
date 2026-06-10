@@ -1,138 +1,91 @@
-# Performance Optimization Guide
+# Performance Notes
 
-This document explains the performance characteristics of osv-report and how its internal parameters affect fetch throughput.
+This document describes the cost profile of the fetch and report paths
+after the migration to the OSV unified `all.zip` download.
 
-## Overview
+## Fetch path
 
-osv-report is optimized for efficient data fetching with the following features:
+Fetch is dominated by one HTTP transaction:
 
-1. **Rate Limiting**: Prevents API throttling by limiting requests per second
-2. **Parallel Processing**: Processes multiple vulnerabilities concurrently
-3. **Batch Processing**: Processes entries in fixed batch sizes
-4. **HTTP Timeout**: Prevents hanging on slow network connections
-5. **Cursor-based Incremental Fetching**: Only fetches new or updated data
+1. `GET https://osv-vulnerabilities.storage.googleapis.com/all.zip` with
+   `If-None-Match: <prev ETag>`.
+2. If the server replies `304 Not Modified`, the fetch path returns
+   without doing any work other than the HEAD-equivalent round trip.
+3. Otherwise the body (~1.2 GiB as of 2026-06) streams into a temp
+   file. The zip is then iterated record-by-record; each entry whose
+   ecosystem intersects `OSV_ECOSYSTEMS` is upserted via the combined
+   `SaveVulnerabilityWithAffected` transaction.
 
-## Compiled-in Constants
+There is no rate limiter, no retry transport, no per-vulnerability HTTP
+call, no per-ecosystem zip download, no goroutine fan-out, and no
+batching. The previous code base that needed those knobs has been
+replaced; `internal/config/config.go` no longer exposes
+`RateLimit`/`MaxConcurrency`/`BatchSize`/`HTTPTimeout` because nothing
+in the call graph reads them anymore.
 
-All performance parameters are compiled-in constants defined in `internal/config/config.go`. To change them, edit the source and rebuild.
+### Cursor and ETag
 
-### Rate Limit
+Two pieces of state persist between runs in the `source_cursor` row
+with key `__unified__`:
 
-**Value**: `10.0` requests per second
+- `cursor` — the highest `modified` timestamp the previous run
+  consumed. The Source uses strict `modified > cursor` to skip
+  records that were already processed even when the same zip is
+  downloaded again.
+- `etag` — the HTTP ETag returned by the server. Sending it as
+  `If-None-Match` lets the server respond 304 when the bundle hasn't
+  changed, avoiding the 1.2 GiB transfer entirely.
 
-Controls the maximum number of API requests per second. The client automatically retries with backoff on 429 errors.
+### Withdrawal handling
 
-**Trade-offs**:
-- Higher values risk hitting API rate limits (429 errors)
-- Lower values result in slower data fetching
+Records carry a top-level `withdrawn` RFC3339 timestamp when the
+upstream has withdrawn them. They remain in the bundle (the 0-S spike
+confirmed this across multiple ecosystems), so `withdrawn != null` is
+the authoritative delete signal — no ID-set diff against the local
+store is required.
 
-### Max Concurrency
+### Retention
 
-**Value**: `5` parallel requests
+`OSV_DATA_RETENTION_DAYS` (default 7) is applied at the end of each
+fetch via `DELETE FROM vulnerability WHERE modified < cutoff`. The
+`affected` rows cascade via `ON DELETE CASCADE`.
 
-Controls the maximum number of concurrent API requests.
+## Report path
 
-**Trade-offs**:
-- Higher values: faster processing but more memory and network usage
-- Lower values: slower but more stable
-- Works in combination with rate limiting to prevent API throttling
+`osv-report report` does one SQL query and one file write.
 
-### Batch Size
+- Snapshot mode: `GetVulnerabilitiesForReport` joins `vulnerability ×
+  affected`, optionally filters by `--ecosystem`, orders by
+  `COALESCE(published, modified) DESC`, and streams rows into the
+  chosen formatter.
+- Diff mode: `GetUnreportedVulnerabilities` adds a LEFT JOIN against
+  `report_watermark` and filters `v.fetched_at > COALESCE(reported_until, 0)`.
+  After the file is written, `AdvanceWatermarks` records the maximum
+  `fetched_at` per ecosystem seen in the report. The advance is
+  monotonic at the SQL level, so a re-run with a stricter filter cannot
+  regress the watermark.
 
-**Value**: `100` entries per batch
+Both paths are I/O-light: the report-time cost on a 7-day window is in
+the tens of milliseconds.
 
-Controls the number of entries processed in each batch.
-
-**Trade-offs**:
-- Larger batches: better throughput but higher peak memory usage
-- Smaller batches: more frequent database transactions but lower memory
-- Each batch is processed with parallel processing (up to max concurrency)
-
-### HTTP Timeout
-
-**Value**: `30` seconds
-
-Controls the per-request HTTP client timeout.
-
-**Trade-offs**:
-- Shorter timeout: faster failure detection but may fail on slow networks
-- Longer timeout: more tolerance but may hang longer on network issues
-
-### Data Retention Days
-
-**Value**: configurable via `OSV_DATA_RETENTION_DAYS` (default: `7`)
-
-This is the only performance-related parameter that can be changed at runtime.
-
-**Trade-offs**:
-- Longer retention: larger database, slower queries
-- Shorter retention: smaller database, faster queries
-- Old data is automatically deleted after each fetch
-
-## Expected Performance
-
-With the default constants on a good network connection:
-
-| Ecosystem | Approximate Size | Fetch Time (initial) | Fetch Time (incremental) |
-|-----------|-----------------|---------------------|-------------------------|
-| Go        | ~2,000 vulns    | 3-5 minutes         | 10-30 seconds          |
-| npm       | ~5,000 vulns    | 8-12 minutes        | 30-60 seconds          |
-| PyPI      | ~1,500 vulns    | 2-4 minutes         | 10-30 seconds          |
-| Maven     | ~3,000 vulns    | 5-8 minutes         | 20-40 seconds          |
-
-*Note: Times vary based on network speed, API response time, and current ecosystem size*
-
-## Monitoring
-
-The application logs key performance metrics:
-
-```
-INFO starting vulnerability fetch ecosystems=[npm pypi] rateLimit=10 maxConcurrency=5 batchSize=100
-INFO processing batch ecosystem=npm batchStart=0 batchEnd=100 total=1523
-INFO completed ecosystem ecosystem=npm processed=1523 cursor=2025-10-04T10:30:00Z
-```
-
-### Tips
-
-1. **Monitor API Rate Limit Errors**: if you see frequent 429 errors in the logs, the current rate limit may be too aggressive for your network conditions. Reduce `RateLimit` in `config.go` and rebuild.
-
-2. **Balance Concurrency and Rate Limit**: effective rate is `min(RateLimit, MaxConcurrency / avg_request_time)`. With 200ms average latency: `5 concurrent * 5 req/sec = 25 req/sec theoretical max`, capped at 10 by the rate limiter.
-
-3. **Database Size**: reduce `OSV_DATA_RETENTION_DAYS` to keep the database small. Run `VACUUM` on the SQLite file periodically if size is a concern.
-
-## Benchmarking
+## Reproducing numbers
 
 ```bash
-# Test with small dataset
+# End-to-end timing for a single ecosystem
 time OSV_ECOSYSTEMS=Go ./osv-report fetch
 
-# Compare initial vs incremental
-time OSV_ECOSYSTEMS=Go ./osv-report fetch   # initial
-time OSV_ECOSYSTEMS=Go ./osv-report fetch   # incremental (much faster)
+# Second run hits the ETag and should return in well under a second
+time OSV_ECOSYSTEMS=Go ./osv-report fetch
+
+# Report
+time ./osv-report report --format markdown --output-dir ./reports
+
+# Store-only microbenchmark
+go test -bench=BenchmarkSaveVulnerabilityWithAffected ./internal/store/
 ```
 
-## Troubleshooting
-
-### Problem: Processing is too slow
-
-1. Check network latency to api.osv.dev
-2. If needed, increase `MaxConcurrency` in `config.go` and rebuild
-3. Verify no other rate limits are active (e.g., corporate proxy)
-
-### Problem: Frequent 429 errors
-
-1. Reduce `RateLimit` in `config.go` and rebuild (e.g., from 10.0 to 5.0)
-2. Reduce `MaxConcurrency` if running multiple instances
-3. The client automatically retries with exponential backoff
-
-### Problem: High memory usage
-
-1. Reduce `BatchSize` in `config.go` and rebuild (e.g., from 100 to 50)
-2. Reduce `OSV_DATA_RETENTION_DAYS` (e.g., from 30 to 7)
-3. Run `VACUUM` on the SQLite database
-
-### Problem: Timeout errors
-
-1. Increase `HTTPTimeout` in `config.go` and rebuild (e.g., from 30s to 60s)
-2. Check network connectivity to api.osv.dev
-3. Consider geographic proximity to API servers
+The `BenchmarkSaveVulnerabilityWithAffected` baseline on an Apple M4
+with the pure-Go `modernc.org/sqlite` driver is roughly 80 µs/op
+including the affected-row washout inside the transaction. End-to-end
+fetch wall-clock numbers vary by available bandwidth (the zip is
+~1.2 GiB).

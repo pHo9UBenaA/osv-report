@@ -1,86 +1,90 @@
 ## Database Schema
 
 ### vulnerability
-Stores vulnerability information
+Stores vulnerability information.
 
 ```sql
 CREATE TABLE vulnerability (
     id TEXT PRIMARY KEY, -- Vulnerability ID (e.g., "GHSA-xxxx-xxxx-xxxx")
-    modified TEXT NOT NULL, -- Last updated time (RFC3339 format)
-    published TEXT, -- Publication time (RFC3339 format)
-    summary TEXT, -- Vulnerability summary
-    details TEXT, -- Detailed description
-    severity_base_score REAL, -- CVSS base score rounded to one decimal
-    severity_vector TEXT -- CVSS vector string
+    modified TEXT NOT NULL, -- Last updated time, RFC3339 UTC
+    published TEXT, -- Publication time, RFC3339 UTC; NULL if upstream omitted it
+    summary TEXT,
+    details TEXT,
+    severity_base_score REAL, -- CVSS base score (NULL if no usable CVSS entry)
+    severity_vector TEXT, -- The chosen CVSS vector string
+    severity_type TEXT, -- One of CVSS_V2 / CVSS_V3.0 / CVSS_V3.1 / CVSS_V4.0
+    fetched_at INTEGER NOT NULL -- Ingest timestamp, Unix nanoseconds (drives the diff watermark)
 );
 ```
 
 ### affected
-Stores affected packages for each vulnerability
+Stores affected packages for each vulnerability. The foreign key cascades
+deletions so removing a vulnerability cleans up its package rows in one step.
 
 ```sql
 CREATE TABLE affected (
-    vuln_id TEXT NOT NULL, -- Foreign key to vulnerability.id
-    ecosystem TEXT NOT NULL, -- Ecosystem name (e.g., "npm", "PyPI", "Go")
-    package TEXT NOT NULL, -- Package name
+    vuln_id TEXT NOT NULL,
+    ecosystem TEXT NOT NULL,
+    package TEXT NOT NULL,
     PRIMARY KEY (vuln_id, ecosystem, package),
-    FOREIGN KEY (vuln_id) REFERENCES vulnerability(id)
+    FOREIGN KEY (vuln_id) REFERENCES vulnerability(id) ON DELETE CASCADE
 );
 ```
 
 ### source_cursor
-Manages processing cursor (last processed time) for each ecosystem
+Tracks per-source ingest state. The unified all.zip source uses a single row
+keyed `__unified__`: `cursor` is the last record-level modified time seen,
+`etag` is the HTTP ETag used for `If-None-Match`.
 
 ```sql
 CREATE TABLE source_cursor (
-    source TEXT PRIMARY KEY, -- Ecosystem name (e.g., "npm", "PyPI", "Go")
-    cursor TEXT NOT NULL -- Last processed time (RFC3339 format)
+    source TEXT PRIMARY KEY,
+    cursor TEXT NOT NULL, -- Last processed modified time, RFC3339 UTC
+    etag TEXT -- ETag for If-None-Match; only meaningful for the unified source
 );
 ```
 
-### tombstone
-Records deleted vulnerabilities (tombstones)
+### report_watermark
+One row per ecosystem that has been included in any `--diff` report. Stores
+the maximum `fetched_at` (Unix nanoseconds) that has already been reported;
+new vulnerabilities surface only when their `fetched_at` strictly exceeds
+this. Per-ecosystem keying means an ecosystem-filtered diff run never
+disturbs the watermark of any other ecosystem.
 
 ```sql
-CREATE TABLE tombstone (
-    id TEXT PRIMARY KEY, -- Deleted vulnerability ID
-    deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE report_watermark (
+    ecosystem TEXT PRIMARY KEY,
+    reported_until INTEGER NOT NULL
 );
 ```
 
-### reported_snapshot
-Tracks vulnerabilities included in differential reports
+### schema_version
+Records the highest applied migration. Each migration body and its
+`INSERT INTO schema_version` are wrapped in a single transaction so a crash
+between the two cannot leave a half-applied state.
 
 ```sql
-CREATE TABLE reported_snapshot (
-    id TEXT NOT NULL, -- Vulnerability ID
-    ecosystem TEXT NOT NULL, -- Ecosystem name
-    package TEXT NOT NULL, -- Package name
-    published TEXT, -- Publication time
-    modified TEXT, -- Last modified time
-    severity_base_score REAL, -- CVSS base score (nullable)
-    severity_vector TEXT, -- CVSS vector string
-    PRIMARY KEY (id, ecosystem, package)
+CREATE TABLE schema_version (
+    version INTEGER NOT NULL
 );
 ```
 
 ## Indexes
 
-### Automatic Indexes (from PRIMARY KEY constraints)
+### Automatic indexes (from PRIMARY KEY constraints)
 
-- `vulnerability(id)` - Primary key index
-- `affected(vuln_id, ecosystem, package)` - Composite primary key index
-- `source_cursor(source)` - Primary key index
-- `tombstone(id)` - Primary key index
-- `reported_snapshot(id, ecosystem, package)` - Composite primary key index
+- `vulnerability(id)`
+- `affected(vuln_id, ecosystem, package)`
+- `source_cursor(source)`
+- `report_watermark(ecosystem)`
 
-### Performance Optimization Indexes
+### Performance indexes
 
-- `idx_affected_ecosystem` - Index on `affected(ecosystem)` for efficient ecosystem filtering
-- `idx_vulnerability_modified` - Index on `vulnerability(modified)` for efficient date-based queries and deletion
+- `idx_affected_ecosystem` on `affected(ecosystem)` — for ecosystem-filtered report queries.
+- `idx_vulnerability_modified` on `vulnerability(modified)` — for retention-based deletion.
 
 ## Data Retention
 
-- Vulnerability data older than `OSV_DATA_RETENTION_DAYS` (default: 7 days) is automatically deleted during fetch operations
-- The `source_cursor` table maintains the synchronization state for incremental updates
-- The `reported_snapshot` table is cleared and rebuilt when generating differential reports
+- Vulnerability data older than `OSV_DATA_RETENTION_DAYS` (default: 7 days) is deleted during fetch via `DELETE FROM vulnerability WHERE modified < cutoff`. The `affected` rows cascade.
+- `source_cursor` keeps cross-run state for the unified source (cursor + ETag).
+- `report_watermark` advances per-ecosystem after each `--diff` report.
