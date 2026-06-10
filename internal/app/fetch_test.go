@@ -285,8 +285,8 @@ func TestFetch_RetentionRunsOnAllPathsExceptGetStateFailure(t *testing.T) {
 			wantSaveStates: 1,
 		},
 		{
-			name:    "DecodeFailures",
-			store:   &fakeFetchStore{state: store.SourceState{Ecosystems: canonicalKey("npm")}},
+			name:  "DecodeFailures",
+			store: &fakeFetchStore{state: store.SourceState{Ecosystems: canonicalKey("npm")}},
 			source: &fakeSource{scriptedResult: &osv.FetchResult{ETag: `"new"`, Events: eventsFromSlice([]eventOrErr{
 				{Err: errors.New("bad")},
 			})}},
@@ -509,7 +509,7 @@ func TestFetch_EcosystemsConfigUnchanged_UsesCurrentState(t *testing.T) {
 }
 
 func TestFetch_RecordsOlderThanRetention_SkippedButAdvanceCursor(t *testing.T) {
-	stale := time.Now().Add(-30 * 24 * time.Hour)  // way past 7d default
+	stale := time.Now().Add(-30 * 24 * time.Hour) // way past 7d default
 	fresh := withinRetention()
 
 	st := &fakeFetchStore{state: store.SourceState{Ecosystems: canonicalKey("npm")}}
