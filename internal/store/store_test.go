@@ -8,12 +8,39 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-
 	"github.com/pHo9UBenaA/osv-report/internal/store"
 )
 
 func ptrFloat64(v float64) *float64 { return &v }
+
+func TestNewStore_ForeignKeysEnabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	ctx := context.Background()
+
+	s, err := store.NewStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer s.Close() //nolint:errcheck
+
+	// PRAGMA foreign_keys is per-connection in SQLite. Verify the driver-level
+	// DSN configuration applies the pragma to every pooled connection by
+	// opening an independent handle and inspecting the value there.
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	var enabled int
+	if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
+		t.Fatalf("query PRAGMA foreign_keys: %v", err)
+	}
+	if enabled != 1 {
+		t.Errorf("PRAGMA foreign_keys = %d, want 1", enabled)
+	}
+}
 
 func TestNewStore_ValidPath_CreatesDatabaseFile(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -139,7 +166,7 @@ func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
 		t.Fatalf("SaveVulnerability() error = %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
@@ -203,7 +230,7 @@ func TestSaveVulnerability_WithSummaryAndDetails_PersistsAllFields(t *testing.T)
 		t.Fatalf("SaveVulnerability() error = %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
@@ -234,7 +261,7 @@ func TestNewStore_SchemaIndexes_ExistAfterCreation(t *testing.T) {
 	}
 	defer s.Close() //nolint:errcheck
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
 		t.Fatalf("Open database error = %v", err)
 	}
@@ -264,8 +291,16 @@ func TestSaveAffected_NewRecord_Persists(t *testing.T) {
 	}
 	defer s.Close() //nolint:errcheck
 
+	vulnID := "GHSA-test-affected"
+	if err := s.SaveVulnerability(ctx, store.Vulnerability{
+		ID:       vulnID,
+		Modified: time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("SaveVulnerability() error = %v", err)
+	}
+
 	affected := store.Affected{
-		VulnID:    "GHSA-test-affected",
+		VulnID:    vulnID,
 		Ecosystem: "Go",
 		Package:   "github.com/test/pkg",
 	}
@@ -349,7 +384,7 @@ func TestDeleteVulnerabilitiesOlderThan_MixedAges_RemovesOnlyOld(t *testing.T) {
 		t.Fatalf("DeleteVulnerabilitiesOlderThan() error = %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
@@ -569,7 +604,7 @@ func TestSaveReportSnapshot_ReplaceExisting_ContainsOnlyNewEntries(t *testing.T)
 		t.Fatalf("SaveReportSnapshot() error = %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}

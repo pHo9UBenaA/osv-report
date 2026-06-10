@@ -7,8 +7,27 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
+
+// DriverName is the database/sql driver name registered by the SQLite driver
+// used by this package. Exported so tests can open the database with the same
+// driver as production code.
+const DriverName = "sqlite"
+
+// OpenDSN returns the DSN that NewStore uses, including per-connection PRAGMA
+// configuration that applies to every connection in the pool. Exported so
+// tests can replicate production connection behavior when opening the
+// database directly.
+//
+// PRAGMA foreign_keys and busy_timeout are per-connection in SQLite. Setting
+// them via DSN guarantees every pooled connection has them on, which is the
+// only safe way given database/sql may transparently open new connections.
+// journal_mode=WAL is file-persistent so the DSN entry is for first-time
+// database creation only.
+func OpenDSN(dbPath string) string {
+	return fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", dbPath)
+}
 
 const timeFormat = time.RFC3339
 
@@ -63,9 +82,7 @@ func toNullString(value string) any {
 
 // NewStore creates a new store instance and initializes the database.
 func NewStore(ctx context.Context, dbPath string) (*Store, error) {
-	// Open SQLite database; WAL/busy timeout configured in initSchema
-	connStr := dbPath
-	db, err := sql.Open("sqlite3", connStr)
+	db, err := sql.Open(DriverName, OpenDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -90,16 +107,10 @@ func NewStore(ctx context.Context, dbPath string) (*Store, error) {
 }
 
 func (s *Store) initSchema(ctx context.Context) error {
-	// Enable SQLite optimizations
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
-	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
-			return fmt.Errorf("execute pragma: %w", err)
-		}
-	}
+	// PRAGMA configuration is applied via the DSN (see OpenDSN) so it takes
+	// effect on every pooled connection, not just the one that runs
+	// initSchema. Per-connection Exec is unreliable because database/sql can
+	// open additional connections at any time.
 
 	// Create schema
 	schema := `
