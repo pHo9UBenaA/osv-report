@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -56,31 +55,25 @@ func processEntry(ctx context.Context, client Client, st FetchStore, entry model
 		slog.Debug("parse severity", "id", vuln.ID, "vector", vector, "err", err)
 	}
 
-	var base sql.NullFloat64
-	if baseScore != nil {
-		base = sql.NullFloat64{Float64: *baseScore, Valid: true}
+	affected := make([]store.Affected, len(vuln.Affected))
+	for i, a := range vuln.Affected {
+		affected[i] = store.Affected{
+			VulnID:    vuln.ID,
+			Ecosystem: a.Ecosystem,
+			Package:   a.Name,
+		}
 	}
 
-	if err := st.SaveVulnerability(ctx, store.Vulnerability{
+	if err := st.SaveVulnerabilityWithAffected(ctx, store.Vulnerability{
 		ID:                vuln.ID,
 		Modified:          vuln.Modified,
 		Published:         vuln.Published,
 		Summary:           vuln.Summary,
 		Details:           vuln.Details,
-		SeverityBaseScore: base,
+		SeverityBaseScore: baseScore,
 		SeverityVector:    vector,
-	}); err != nil {
+	}, affected); err != nil {
 		return fmt.Errorf("save vulnerability: %w", err)
-	}
-
-	for _, affected := range vuln.Affected {
-		if err := st.SaveAffected(ctx, store.Affected{
-			VulnID:    vuln.ID,
-			Ecosystem: affected.Ecosystem,
-			Package:   affected.Name,
-		}); err != nil {
-			return fmt.Errorf("save affected: %w", err)
-		}
 	}
 
 	return nil

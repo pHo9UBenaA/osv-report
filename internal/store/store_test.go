@@ -107,7 +107,7 @@ func TestGetCursor_ErrorConditions(t *testing.T) {
 	})
 }
 
-func TestSaveVulnerability_NewEntry_PersistsIdempotently(t *testing.T) {
+func TestSaveVulnerabilityWithAffected_NewEntry_PersistsIdempotently(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
@@ -116,24 +116,24 @@ func TestSaveVulnerability_NewEntry_PersistsIdempotently(t *testing.T) {
 		Modified: time.Date(2025, 10, 4, 12, 34, 56, 0, time.UTC),
 	}
 
-	if err := s.SaveVulnerability(ctx, vuln); err != nil {
-		t.Fatalf("SaveVulnerability() error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln, nil); err != nil {
+		t.Fatalf("first SaveVulnerabilityWithAffected: %v", err)
 	}
 
-	if err := s.SaveVulnerability(ctx, vuln); err != nil {
-		t.Fatalf("SaveVulnerability() second call error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln, nil); err != nil {
+		t.Fatalf("second SaveVulnerabilityWithAffected: %v", err)
 	}
 }
 
-func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
+func TestSaveVulnerabilityWithAffected_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	ctx := context.Background()
 
 	vulnID := "GHSA-severity-check"
 	modified := time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC)
 
-	if err := s.SaveVulnerability(ctx, store.Vulnerability{ID: vulnID, Modified: modified}); err != nil {
-		t.Fatalf("SaveVulnerability() error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, store.Vulnerability{ID: vulnID, Modified: modified}, nil); err != nil {
+		t.Fatalf("SaveVulnerabilityWithAffected: %v", err)
 	}
 
 	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
@@ -158,12 +158,12 @@ func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
 	update := store.Vulnerability{
 		ID:                vulnID,
 		Modified:          modified.Add(time.Minute),
-		SeverityBaseScore: sql.NullFloat64{Float64: 7.5, Valid: true},
+		SeverityBaseScore: ptrFloat64(7.5),
 		SeverityVector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:H/A:L",
 	}
 
-	if err := s.SaveVulnerability(ctx, update); err != nil {
-		t.Fatalf("SaveVulnerability(update) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, update, nil); err != nil {
+		t.Fatalf("SaveVulnerabilityWithAffected(update): %v", err)
 	}
 
 	if err := db.QueryRowContext(ctx, "SELECT severity_base_score, severity_vector FROM vulnerability WHERE id = ?", vulnID).Scan(&base, &vector); err != nil {
@@ -178,7 +178,7 @@ func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
 	}
 }
 
-func TestSaveVulnerability_WithSummaryAndDetails_PersistsAllFields(t *testing.T) {
+func TestSaveVulnerabilityWithAffected_WithSummaryAndDetails_PersistsAllFields(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	ctx := context.Background()
 
@@ -189,8 +189,8 @@ func TestSaveVulnerability_WithSummaryAndDetails_PersistsAllFields(t *testing.T)
 		Details:  "Detailed description of the vulnerability",
 	}
 
-	if err := s.SaveVulnerability(ctx, vuln); err != nil {
-		t.Fatalf("SaveVulnerability() error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln, nil); err != nil {
+		t.Fatalf("SaveVulnerabilityWithAffected: %v", err)
 	}
 
 	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
@@ -236,26 +236,21 @@ func TestNewStore_SchemaIndexes_ExistAfterCreation(t *testing.T) {
 	}
 }
 
-func TestSaveAffected_NewRecord_Persists(t *testing.T) {
+func TestSaveVulnerabilityWithAffected_SingleAffected_Persists(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
 	vulnID := "GHSA-test-affected"
-	if err := s.SaveVulnerability(ctx, store.Vulnerability{
+	v := store.Vulnerability{
 		ID:       vulnID,
 		Modified: time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC),
-	}); err != nil {
-		t.Fatalf("SaveVulnerability() error = %v", err)
+	}
+	affected := []store.Affected{
+		{VulnID: vulnID, Ecosystem: "Go", Package: "github.com/test/pkg"},
 	}
 
-	affected := store.Affected{
-		VulnID:    vulnID,
-		Ecosystem: "Go",
-		Package:   "github.com/test/pkg",
-	}
-
-	if err := s.SaveAffected(ctx, affected); err != nil {
-		t.Fatalf("SaveAffected() error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, affected); err != nil {
+		t.Fatalf("SaveVulnerabilityWithAffected: %v", err)
 	}
 }
 
@@ -279,39 +274,19 @@ func TestDeleteVulnerabilitiesOlderThan_MixedAges_RemovesOnlyOld(t *testing.T) {
 	ctx := context.Background()
 
 	oldTime := time.Now().AddDate(0, 0, -14)
-	oldVuln := store.Vulnerability{
-		ID:       "GHSA-old-vuln",
-		Modified: oldTime,
-	}
-	if err := s.SaveVulnerability(ctx, oldVuln); err != nil {
-		t.Fatalf("SaveVulnerability(old) error = %v", err)
-	}
-
-	oldAffected := store.Affected{
-		VulnID:    "GHSA-old-vuln",
-		Ecosystem: "npm",
-		Package:   "old-package",
-	}
-	if err := s.SaveAffected(ctx, oldAffected); err != nil {
-		t.Fatalf("SaveAffected(old) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx,
+		store.Vulnerability{ID: "GHSA-old-vuln", Modified: oldTime},
+		[]store.Affected{{VulnID: "GHSA-old-vuln", Ecosystem: "npm", Package: "old-package"}},
+	); err != nil {
+		t.Fatalf("save old: %v", err)
 	}
 
 	newTime := time.Now().AddDate(0, 0, -3)
-	newVuln := store.Vulnerability{
-		ID:       "GHSA-new-vuln",
-		Modified: newTime,
-	}
-	if err := s.SaveVulnerability(ctx, newVuln); err != nil {
-		t.Fatalf("SaveVulnerability(new) error = %v", err)
-	}
-
-	newAffected := store.Affected{
-		VulnID:    "GHSA-new-vuln",
-		Ecosystem: "npm",
-		Package:   "new-package",
-	}
-	if err := s.SaveAffected(ctx, newAffected); err != nil {
-		t.Fatalf("SaveAffected(new) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx,
+		store.Vulnerability{ID: "GHSA-new-vuln", Modified: newTime},
+		[]store.Affected{{VulnID: "GHSA-new-vuln", Ecosystem: "npm", Package: "new-package"}},
+	); err != nil {
+		t.Fatalf("save new: %v", err)
 	}
 
 	cutoff := time.Now().AddDate(0, 0, -7)
@@ -371,20 +346,13 @@ func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *test
 		Modified:          time.Now(),
 		Summary:           "Test vulnerability 1",
 		Details:           "Details for test vulnerability 1",
-		SeverityBaseScore: sql.NullFloat64{Float64: 9.8, Valid: true},
+		SeverityBaseScore: ptrFloat64(9.8),
 		SeverityVector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 	}
-	if err := s.SaveVulnerability(ctx, vuln1); err != nil {
-		t.Fatalf("SaveVulnerability(1) error = %v", err)
-	}
-
-	affected1 := store.Affected{
-		VulnID:    "GHSA-1234-5678-90ab",
-		Ecosystem: "npm",
-		Package:   "test-package-1",
-	}
-	if err := s.SaveAffected(ctx, affected1); err != nil {
-		t.Fatalf("SaveAffected(1) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln1,
+		[]store.Affected{{VulnID: vuln1.ID, Ecosystem: "npm", Package: "test-package-1"}},
+	); err != nil {
+		t.Fatalf("save vuln1: %v", err)
 	}
 
 	vuln2 := store.Vulnerability{
@@ -394,17 +362,10 @@ func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *test
 		Details:        "Details for test vulnerability 2",
 		SeverityVector: "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
 	}
-	if err := s.SaveVulnerability(ctx, vuln2); err != nil {
-		t.Fatalf("SaveVulnerability(2) error = %v", err)
-	}
-
-	affected2 := store.Affected{
-		VulnID:    "GHSA-abcd-efgh-ijkl",
-		Ecosystem: "PyPI",
-		Package:   "test-package-2",
-	}
-	if err := s.SaveAffected(ctx, affected2); err != nil {
-		t.Fatalf("SaveAffected(2) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln2,
+		[]store.Affected{{VulnID: vuln2.ID, Ecosystem: "PyPI", Package: "test-package-2"}},
+	); err != nil {
+		t.Fatalf("save vuln2: %v", err)
 	}
 
 	entries, err := s.GetVulnerabilitiesForReport(ctx, "")
@@ -446,28 +407,23 @@ func TestGetVulnerabilitiesForReport_DifferentDates_SortsByPublishedDescending(t
 	middlePublished := time.Date(2025, 10, 2, 0, 0, 0, 0, time.UTC)
 	newestPublished := time.Date(2025, 10, 3, 0, 0, 0, 0, time.UTC)
 
-	vuln1 := store.Vulnerability{ID: "GHSA-oldest", Modified: time.Now(), Published: oldestPublished}
-	if err := s.SaveVulnerability(ctx, vuln1); err != nil {
-		t.Fatalf("SaveVulnerability(oldest) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx,
+		store.Vulnerability{ID: "GHSA-oldest", Modified: time.Now(), Published: oldestPublished},
+		[]store.Affected{{VulnID: "GHSA-oldest", Ecosystem: "npm", Package: "pkg1"}},
+	); err != nil {
+		t.Fatalf("save oldest: %v", err)
 	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-oldest", Ecosystem: "npm", Package: "pkg1"}); err != nil {
-		t.Fatalf("SaveAffected(oldest) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx,
+		store.Vulnerability{ID: "GHSA-newest", Modified: time.Now(), Published: newestPublished},
+		[]store.Affected{{VulnID: "GHSA-newest", Ecosystem: "npm", Package: "pkg2"}},
+	); err != nil {
+		t.Fatalf("save newest: %v", err)
 	}
-
-	vuln2 := store.Vulnerability{ID: "GHSA-newest", Modified: time.Now(), Published: newestPublished}
-	if err := s.SaveVulnerability(ctx, vuln2); err != nil {
-		t.Fatalf("SaveVulnerability(newest) error = %v", err)
-	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-newest", Ecosystem: "npm", Package: "pkg2"}); err != nil {
-		t.Fatalf("SaveAffected(newest) error = %v", err)
-	}
-
-	vuln3 := store.Vulnerability{ID: "GHSA-middle", Modified: time.Now(), Published: middlePublished}
-	if err := s.SaveVulnerability(ctx, vuln3); err != nil {
-		t.Fatalf("SaveVulnerability(middle) error = %v", err)
-	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-middle", Ecosystem: "npm", Package: "pkg3"}); err != nil {
-		t.Fatalf("SaveAffected(middle) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx,
+		store.Vulnerability{ID: "GHSA-middle", Modified: time.Now(), Published: middlePublished},
+		[]store.Affected{{VulnID: "GHSA-middle", Ecosystem: "npm", Package: "pkg3"}},
+	); err != nil {
+		t.Fatalf("save middle: %v", err)
 	}
 
 	entries, err := s.GetVulnerabilitiesForReport(ctx, "")
@@ -559,36 +515,107 @@ func TestSaveReportSnapshot_ReplaceExisting_ContainsOnlyNewEntries(t *testing.T)
 	}
 }
 
+func TestSaveVulnerabilityWithAffected_ShrinksAffectedRows(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	vulnID := "GHSA-shrink-test"
+	modified := time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC)
+	v := store.Vulnerability{ID: vulnID, Modified: modified}
+
+	first := []store.Affected{
+		{VulnID: vulnID, Ecosystem: "npm", Package: "a"},
+		{VulnID: vulnID, Ecosystem: "npm", Package: "b"},
+	}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, first); err != nil {
+		t.Fatalf("first SaveVulnerabilityWithAffected: %v", err)
+	}
+
+	second := []store.Affected{
+		{VulnID: vulnID, Ecosystem: "npm", Package: "a"},
+	}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, second); err != nil {
+		t.Fatalf("second SaveVulnerabilityWithAffected: %v", err)
+	}
+
+	rows, err := s.GetVulnerabilitiesForReport(ctx, "npm")
+	if err != nil {
+		t.Fatalf("GetVulnerabilitiesForReport: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("after shrinking affected: got %d rows, want 1 (b should be gone)", len(rows))
+	}
+	if rows[0].Package != "a" {
+		t.Errorf("surviving row Package = %q, want %q", rows[0].Package, "a")
+	}
+}
+
+func TestSaveVulnerabilityWithAffected_PublishedNullSortsBeforeOnlyModified(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	// Vulnerability A: published unset (zero time), modified at time T2.
+	// Vulnerability B: published at T1 (earlier than T2), modified at T1.
+	// Expected order (DESC by COALESCE(published, modified)): A first (T2), then B (T1).
+	// If A's missing published was stored as empty string, A would sort last under
+	// SQLite's text comparison instead of falling back to modified.
+	t1 := time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2025, 10, 5, 0, 0, 0, 0, time.UTC)
+
+	a := store.Vulnerability{ID: "GHSA-a", Modified: t2}
+	if err := s.SaveVulnerabilityWithAffected(ctx, a, []store.Affected{{VulnID: "GHSA-a", Ecosystem: "npm", Package: "pkg-a"}}); err != nil {
+		t.Fatalf("save A: %v", err)
+	}
+
+	b := store.Vulnerability{ID: "GHSA-b", Modified: t1, Published: t1}
+	if err := s.SaveVulnerabilityWithAffected(ctx, b, []store.Affected{{VulnID: "GHSA-b", Ecosystem: "npm", Package: "pkg-b"}}); err != nil {
+		t.Fatalf("save B: %v", err)
+	}
+
+	rows, err := s.GetVulnerabilitiesForReport(ctx, "npm")
+	if err != nil {
+		t.Fatalf("GetVulnerabilitiesForReport: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].ID != "GHSA-a" {
+		t.Errorf("expected GHSA-a (modified T2) to sort first, got order: %s, %s", rows[0].ID, rows[1].ID)
+	}
+}
+
 func TestGetUnreportedVulnerabilities_MixedState_ReturnsModifiedAndNew(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
+	// Use a fixed UTC timestamp so the stored vuln.modified string matches the
+	// snapshot's modified string under the UTC-forcing write path.
+	unchangedModified := time.Date(2025, 10, 5, 12, 0, 0, 0, time.UTC)
+
 	vuln1 := store.Vulnerability{
 		ID:                "GHSA-unchanged",
-		Modified:          time.Now(),
+		Modified:          unchangedModified,
 		Published:         time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC),
-		SeverityBaseScore: sql.NullFloat64{Float64: 9.8, Valid: true},
+		SeverityBaseScore: ptrFloat64(9.8),
 		SeverityVector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 	}
-	if err := s.SaveVulnerability(ctx, vuln1); err != nil {
-		t.Fatalf("SaveVulnerability(unchanged) error = %v", err)
-	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-unchanged", Ecosystem: "npm", Package: "pkg-unchanged"}); err != nil {
-		t.Fatalf("SaveAffected(unchanged) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln1,
+		[]store.Affected{{VulnID: vuln1.ID, Ecosystem: "npm", Package: "pkg-unchanged"}},
+	); err != nil {
+		t.Fatalf("save unchanged: %v", err)
 	}
 
 	vuln2 := store.Vulnerability{
 		ID:                "GHSA-modified",
 		Modified:          time.Date(2025, 10, 3, 0, 0, 0, 0, time.UTC),
 		Published:         time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC),
-		SeverityBaseScore: sql.NullFloat64{Float64: 6.4, Valid: true},
+		SeverityBaseScore: ptrFloat64(6.4),
 		SeverityVector:    "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
 	}
-	if err := s.SaveVulnerability(ctx, vuln2); err != nil {
-		t.Fatalf("SaveVulnerability(modified) error = %v", err)
-	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-modified", Ecosystem: "npm", Package: "pkg-modified"}); err != nil {
-		t.Fatalf("SaveAffected(modified) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln2,
+		[]store.Affected{{VulnID: vuln2.ID, Ecosystem: "npm", Package: "pkg-modified"}},
+	); err != nil {
+		t.Fatalf("save modified: %v", err)
 	}
 
 	vuln3 := store.Vulnerability{
@@ -596,11 +623,10 @@ func TestGetUnreportedVulnerabilities_MixedState_ReturnsModifiedAndNew(t *testin
 		Modified:  time.Now(),
 		Published: time.Date(2025, 10, 2, 0, 0, 0, 0, time.UTC),
 	}
-	if err := s.SaveVulnerability(ctx, vuln3); err != nil {
-		t.Fatalf("SaveVulnerability(new) error = %v", err)
-	}
-	if err := s.SaveAffected(ctx, store.Affected{VulnID: "GHSA-new", Ecosystem: "PyPI", Package: "pkg-new"}); err != nil {
-		t.Fatalf("SaveAffected(new) error = %v", err)
+	if err := s.SaveVulnerabilityWithAffected(ctx, vuln3,
+		[]store.Affected{{VulnID: vuln3.ID, Ecosystem: "PyPI", Package: "pkg-new"}},
+	); err != nil {
+		t.Fatalf("save new: %v", err)
 	}
 
 	snapshot := []store.ReportRow{
@@ -609,7 +635,7 @@ func TestGetUnreportedVulnerabilities_MixedState_ReturnsModifiedAndNew(t *testin
 			Ecosystem:      "npm",
 			Package:        "pkg-unchanged",
 			Published:      "2025-10-01T00:00:00Z",
-			Modified:       time.Now().Format(time.RFC3339),
+			Modified:       unchangedModified.Format(time.RFC3339),
 			SeverityScore:  ptrFloat64(9.8),
 			SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 		},

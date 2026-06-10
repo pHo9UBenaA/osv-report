@@ -38,17 +38,11 @@ func (f *fakeStore) DeleteVulnerabilitiesOlderThan(_ context.Context, _ time.Tim
 	return nil
 }
 
-func (f *fakeStore) SaveVulnerability(_ context.Context, v store.Vulnerability) error {
+func (f *fakeStore) SaveVulnerabilityWithAffected(_ context.Context, v store.Vulnerability, affected []store.Affected) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.savedVulns = append(f.savedVulns, v)
-	return nil
-}
-
-func (f *fakeStore) SaveAffected(_ context.Context, a store.Affected) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.savedAffected = append(f.savedAffected, a)
+	f.savedAffected = append(f.savedAffected, affected...)
 	return nil
 }
 
@@ -100,8 +94,8 @@ func TestProcessEntry_VulnFound_SavesVulnAndAffected(t *testing.T) {
 	if v.Summary != "Test vulnerability" {
 		t.Errorf("Summary = %q, want %q", v.Summary, "Test vulnerability")
 	}
-	if !v.SeverityBaseScore.Valid || v.SeverityBaseScore.Float64 != 9.8 {
-		t.Errorf("SeverityBaseScore = %v (valid=%v), want 9.8", v.SeverityBaseScore.Float64, v.SeverityBaseScore.Valid)
+	if v.SeverityBaseScore == nil || *v.SeverityBaseScore != 9.8 {
+		t.Errorf("SeverityBaseScore = %v, want 9.8", v.SeverityBaseScore)
 	}
 	if v.SeverityVector != "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" {
 		t.Errorf("SeverityVector = %q, want CVSS vector", v.SeverityVector)

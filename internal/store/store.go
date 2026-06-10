@@ -38,7 +38,7 @@ type Vulnerability struct {
 	Published         time.Time
 	Summary           string
 	Details           string
-	SeverityBaseScore sql.NullFloat64
+	SeverityBaseScore *float64
 	SeverityVector    string
 }
 
@@ -66,11 +66,11 @@ type Store struct {
 	db *sql.DB
 }
 
-func toNullFloat64(value sql.NullFloat64) any {
-	if value.Valid {
-		return value.Float64
+func toNullableFloat(value *float64) any {
+	if value == nil {
+		return nil
 	}
-	return nil
+	return *value
 }
 
 func toNullString(value string) any {
@@ -78,6 +78,23 @@ func toNullString(value string) any {
 		return value
 	}
 	return nil
+}
+
+// withTx runs fn inside a single database transaction. The transaction is
+// committed if fn returns nil and rolled back otherwise. Wrapping each
+// schema migration this way makes the "execute migration + record version"
+// pair atomic, so a crash between the two cannot leave a half-applied
+// migration that would re-run destructively on next startup.
+func withTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // NewStore creates a new store instance and initializes the database.
@@ -169,41 +186,95 @@ func (s *Store) initSchema(ctx context.Context) error {
 }
 
 func (s *Store) runMigrations(ctx context.Context) error {
-	// Create schema_version table if it doesn't exist
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_version (
 			version INTEGER NOT NULL
 		)
-	`)
-	if err != nil {
+	`); err != nil {
 		return fmt.Errorf("create schema_version table: %w", err)
 	}
 
-	// Get current version
 	var version int
-	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_version").Scan(&version)
-	if err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_version").Scan(&version); err != nil {
 		return fmt.Errorf("get schema version: %w", err)
 	}
 
 	// All migrations in order. Each migration runs exactly once.
+	//
+	// disablesFKDuringRebuild applies to migrations that recreate a table with
+	// foreign keys (the SQLite documented "12-step ALTER" workaround). The
+	// rebuild must run with foreign_keys=OFF so the intermediate state with
+	// duplicated rows doesn't trigger constraint failures. PRAGMA foreign_keys
+	// is a no-op inside a transaction, so the toggle has to wrap the tx.
 	type migration struct {
-		version int
-		sql     string
+		version                 int
+		sql                     string
+		disablesFKDuringRebuild bool
 	}
 	migrations := []migration{
-		{1, "DROP TABLE IF EXISTS package_metrics"},
+		{version: 1, sql: "DROP TABLE IF EXISTS package_metrics"},
+		{
+			version: 2,
+			sql: `
+				CREATE TABLE affected_new (
+					vuln_id TEXT NOT NULL,
+					ecosystem TEXT NOT NULL,
+					package TEXT NOT NULL,
+					PRIMARY KEY (vuln_id, ecosystem, package),
+					FOREIGN KEY (vuln_id) REFERENCES vulnerability(id) ON DELETE CASCADE
+				);
+				INSERT INTO affected_new (vuln_id, ecosystem, package)
+					SELECT vuln_id, ecosystem, package FROM affected;
+				DROP TABLE affected;
+				ALTER TABLE affected_new RENAME TO affected;
+				CREATE INDEX IF NOT EXISTS idx_affected_ecosystem ON affected(ecosystem);
+			`,
+			disablesFKDuringRebuild: true,
+		},
+		{version: 3, sql: "UPDATE vulnerability SET published = NULL WHERE published = ''"},
 	}
 
 	for _, m := range migrations {
 		if m.version <= version {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, m.sql); err != nil {
-			return fmt.Errorf("migration v%d: %w", m.version, err)
+		if m.disablesFKDuringRebuild {
+			if _, err := s.db.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+				return fmt.Errorf("disable foreign_keys for v%d: %w", m.version, err)
+			}
 		}
-		if _, err := s.db.ExecContext(ctx, "INSERT INTO schema_version (version) VALUES (?)", m.version); err != nil {
-			return fmt.Errorf("update schema version to %d: %w", m.version, err)
+		err := withTx(ctx, s.db, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, m.sql); err != nil {
+				return fmt.Errorf("migration v%d: %w", m.version, err)
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO schema_version (version) VALUES (?)", m.version); err != nil {
+				return fmt.Errorf("update schema version to %d: %w", m.version, err)
+			}
+			return nil
+		})
+		if m.disablesFKDuringRebuild {
+			// Restore FK regardless of migration outcome so subsequent connection
+			// reuse can't see foreign_keys=OFF (a leaked PRAGMA outlives the tx).
+			if _, e := s.db.ExecContext(ctx, "PRAGMA foreign_keys=ON"); e != nil {
+				return fmt.Errorf("re-enable foreign_keys after v%d: %w", m.version, e)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if m.disablesFKDuringRebuild {
+			// Confirm no orphan rows were left behind by the rebuild. Scan a single
+			// row: sql.ErrNoRows means the check is clean; any other outcome is a
+			// violation that should fail the migration loudly.
+			var table, parent sql.NullString
+			var rowid, fkid sql.NullInt64
+			scanErr := s.db.QueryRowContext(ctx, "PRAGMA foreign_key_check").Scan(&table, &rowid, &parent, &fkid)
+			if scanErr == nil {
+				return fmt.Errorf("foreign_key_check after v%d: orphan in %s", m.version, table.String)
+			}
+			if !errors.Is(scanErr, sql.ErrNoRows) {
+				return fmt.Errorf("foreign_key_check after v%d: %w", m.version, scanErr)
+			}
 		}
 	}
 
@@ -217,7 +288,7 @@ func (s *Store) SaveCursor(ctx context.Context, source string, cursor time.Time)
 		VALUES (?, ?)
 		ON CONFLICT(source) DO UPDATE SET cursor = excluded.cursor
 	`
-	_, err := s.db.ExecContext(ctx, query, source, cursor.Format(timeFormat))
+	_, err := s.db.ExecContext(ctx, query, source, cursor.UTC().Format(timeFormat))
 	if err != nil {
 		return fmt.Errorf("save cursor: %w", err)
 	}
@@ -248,44 +319,67 @@ func (s *Store) GetCursor(ctx context.Context, source string) (time.Time, error)
 	return cursor, nil
 }
 
-// SaveVulnerability saves a vulnerability record to the database.
-func (s *Store) SaveVulnerability(ctx context.Context, v Vulnerability) error {
-	publishedStr := ""
+// SaveVulnerabilityWithAffected upserts a vulnerability and replaces its
+// affected-package set atomically.
+//
+// Why one combined API rather than two separate calls: OSV publishes the
+// complete affected set with each vulnerability record, so an additive
+// "append affected rows" API leaks stale entries when an upstream record
+// shrinks its affected list. The DELETE inside the tx makes the persisted
+// set match the input set exactly.
+func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerability, affected []Affected) error {
+	publishedParam := any(nil)
 	if !v.Published.IsZero() {
-		publishedStr = v.Published.Format(timeFormat)
+		publishedParam = v.Published.UTC().Format(timeFormat)
 	}
 
-	query := `
-		INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			modified = excluded.modified,
-			published = excluded.published,
-			summary = excluded.summary,
-			details = excluded.details,
-			severity_base_score = excluded.severity_base_score,
-			severity_vector = excluded.severity_vector
-	`
+	return withTx(ctx, s.db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				modified = excluded.modified,
+				published = excluded.published,
+				summary = excluded.summary,
+				details = excluded.details,
+				severity_base_score = excluded.severity_base_score,
+				severity_vector = excluded.severity_vector
+		`,
+			v.ID,
+			v.Modified.UTC().Format(timeFormat),
+			publishedParam,
+			v.Summary,
+			v.Details,
+			toNullableFloat(v.SeverityBaseScore),
+			toNullString(v.SeverityVector),
+		); err != nil {
+			return fmt.Errorf("upsert vulnerability: %w", err)
+		}
 
-	_, err := s.db.ExecContext(ctx, query, v.ID, v.Modified.Format(timeFormat), publishedStr, v.Summary, v.Details, toNullFloat64(v.SeverityBaseScore), toNullString(v.SeverityVector))
-	if err != nil {
-		return fmt.Errorf("save vulnerability: %w", err)
-	}
-	return nil
-}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM affected WHERE vuln_id = ?", v.ID); err != nil {
+			return fmt.Errorf("delete old affected: %w", err)
+		}
 
-// SaveAffected saves an affected package record.
-func (s *Store) SaveAffected(ctx context.Context, a Affected) error {
-	query := `
-		INSERT INTO affected (vuln_id, ecosystem, package)
-		VALUES (?, ?, ?)
-		ON CONFLICT(vuln_id, ecosystem, package) DO NOTHING
-	`
-	_, err := s.db.ExecContext(ctx, query, a.VulnID, a.Ecosystem, a.Package)
-	if err != nil {
-		return fmt.Errorf("save affected: %w", err)
-	}
-	return nil
+		if len(affected) == 0 {
+			return nil
+		}
+
+		stmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO affected (vuln_id, ecosystem, package)
+			VALUES (?, ?, ?)
+			ON CONFLICT(vuln_id, ecosystem, package) DO NOTHING
+		`)
+		if err != nil {
+			return fmt.Errorf("prepare insert affected: %w", err)
+		}
+		defer stmt.Close() //nolint:errcheck
+		for _, a := range affected {
+			if _, err := stmt.ExecContext(ctx, a.VulnID, a.Ecosystem, a.Package); err != nil {
+				return fmt.Errorf("insert affected: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // SaveTombstone records a deleted vulnerability ID.
@@ -361,7 +455,7 @@ func (s *Store) DeleteVulnerabilitiesOlderThan(ctx context.Context, cutoff time.
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	cutoffStr := cutoff.Format(timeFormat)
+	cutoffStr := cutoff.UTC().Format(timeFormat)
 
 	// Delete affected records for old vulnerabilities
 	_, err = tx.ExecContext(ctx, `

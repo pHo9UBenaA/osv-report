@@ -28,8 +28,7 @@ type EcosystemLister interface {
 type FetchStore interface {
 	GetCursor(ctx context.Context, source string) (time.Time, error)
 	SaveCursor(ctx context.Context, source string, cursor time.Time) error
-	SaveVulnerability(ctx context.Context, v store.Vulnerability) error
-	SaveAffected(ctx context.Context, a store.Affected) error
+	SaveVulnerabilityWithAffected(ctx context.Context, v store.Vulnerability, affected []store.Affected) error
 	SaveTombstone(ctx context.Context, id string) error
 	DeleteVulnerabilitiesOlderThan(ctx context.Context, cutoff time.Time) error
 }
