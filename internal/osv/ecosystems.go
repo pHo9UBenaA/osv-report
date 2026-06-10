@@ -11,25 +11,24 @@ import (
 
 const defaultEcosystemsHTTPTimeout = 10 * time.Second
 
-// EcosystemsFetcher fetches the canonical list of OSV ecosystems.
-type EcosystemsFetcher interface {
-	FetchEcosystems(ctx context.Context) ([]string, error)
-}
-
-type ecosystemsFetcher struct {
+// EcosystemsFetcher retrieves the canonical OSV ecosystem list over HTTP.
+// Consumers should depend on a locally-defined interface; this concrete type
+// satisfies them structurally.
+type EcosystemsFetcher struct {
 	url        string
 	httpClient *http.Client
 }
 
 // NewEcosystemsFetcher creates a fetcher that retrieves ecosystems from the given URL.
-func NewEcosystemsFetcher(url string, client *http.Client) EcosystemsFetcher {
+func NewEcosystemsFetcher(url string, client *http.Client) *EcosystemsFetcher {
 	if client == nil {
 		client = &http.Client{Timeout: defaultEcosystemsHTTPTimeout}
 	}
-	return &ecosystemsFetcher{url: url, httpClient: client}
+	return &EcosystemsFetcher{url: url, httpClient: client}
 }
 
-func (f *ecosystemsFetcher) FetchEcosystems(ctx context.Context) ([]string, error) {
+// FetchEcosystems downloads the ecosystem list and returns the parsed names.
+func (f *EcosystemsFetcher) FetchEcosystems(ctx context.Context) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
