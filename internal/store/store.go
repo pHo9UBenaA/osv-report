@@ -40,6 +40,7 @@ type Vulnerability struct {
 	Details           string
 	SeverityBaseScore *float64
 	SeverityVector    string
+	SeverityType      string
 }
 
 // Affected represents an affected package in the database.
@@ -65,6 +66,7 @@ type ReportRow struct {
 	FetchedAt      int64
 	SeverityScore  *float64
 	SeverityVector string
+	SeverityType   string
 }
 
 // Store manages database operations for the OSV scraper.
@@ -263,6 +265,7 @@ func (s *Store) runMigrations(ctx context.Context) error {
 				DROP TABLE reported_snapshot;
 			`,
 		},
+		{version: 6, sql: "ALTER TABLE vulnerability ADD COLUMN severity_type TEXT"},
 	}
 
 	for _, m := range migrations {
@@ -372,8 +375,8 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 
 	return withTx(ctx, s.db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector, fetched_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector, severity_type, fetched_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				modified = excluded.modified,
 				published = excluded.published,
@@ -381,6 +384,7 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 				details = excluded.details,
 				severity_base_score = excluded.severity_base_score,
 				severity_vector = excluded.severity_vector,
+				severity_type = excluded.severity_type,
 				fetched_at = excluded.fetched_at
 		`,
 			v.ID,
@@ -390,6 +394,7 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 			v.Details,
 			toNullableFloat(v.SeverityBaseScore),
 			toNullString(v.SeverityVector),
+			toNullString(v.SeverityType),
 			fetchedAt,
 		); err != nil {
 			return fmt.Errorf("upsert vulnerability: %w", err)
@@ -445,7 +450,7 @@ func scanReportRows(rows *sql.Rows) ([]ReportRow, error) {
 		if err := rows.Scan(
 			&r.ID, &r.Ecosystem, &r.Package,
 			&r.Published, &r.Modified, &r.FetchedAt,
-			&score, &r.SeverityVector,
+			&score, &r.SeverityVector, &r.SeverityType,
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
@@ -470,7 +475,8 @@ const reportSelectColumns = `
 	COALESCE(v.published, '') as published,
 	v.modified, v.fetched_at,
 	v.severity_base_score,
-	COALESCE(v.severity_vector, '') as severity_vector`
+	COALESCE(v.severity_vector, '') as severity_vector,
+	COALESCE(v.severity_type, '') as severity_type`
 
 // ecosystemClause returns the WHERE fragment and argument list used to
 // restrict a vulnerability/affected join to a single ecosystem. Empty

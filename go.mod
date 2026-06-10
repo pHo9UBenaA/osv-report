@@ -5,6 +5,7 @@ go 1.25.8
 require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/joho/godotenv v1.5.1
+	github.com/pandatix/go-cvss v0.6.2
 	golang.org/x/sync v0.20.0
 	golang.org/x/time v0.13.0
 	modernc.org/sqlite v1.52.0

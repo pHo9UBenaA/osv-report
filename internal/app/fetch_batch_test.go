@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +72,8 @@ func TestProcessEntry_VulnFound_SavesVulnAndAffected(t *testing.T) {
 	st := &fakeStore{}
 	entry := model.Entry{ID: "GHSA-test-1", Modified: time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)}
 
-	err := processEntry(context.Background(), client, st, entry)
+	var failures atomic.Int64
+	err := processEntry(context.Background(), client, st, entry, &failures)
 	if err != nil {
 		t.Fatalf("processEntry() error = %v", err)
 	}
@@ -117,7 +119,8 @@ func TestProcessEntry_NotFound_SavesTombstone(t *testing.T) {
 	st := &fakeStore{}
 	entry := model.Entry{ID: "GHSA-gone-1", Modified: time.Now()}
 
-	err := processEntry(context.Background(), client, st, entry)
+	var failures atomic.Int64
+	err := processEntry(context.Background(), client, st, entry, &failures)
 	if err != nil {
 		t.Fatalf("processEntry() error = %v", err)
 	}
@@ -135,7 +138,8 @@ func TestProcessEntry_ClientError_PropagatesError(t *testing.T) {
 	st := &fakeStore{}
 	entry := model.Entry{ID: "GHSA-err-1", Modified: time.Now()}
 
-	err := processEntry(context.Background(), client, st, entry)
+	var failures atomic.Int64
+	err := processEntry(context.Background(), client, st, entry, &failures)
 	if err == nil {
 		t.Fatal("processEntry() expected error, got nil")
 	}
@@ -163,7 +167,8 @@ func TestProcessEntriesParallel_MultipleEntries_AllProcessed(t *testing.T) {
 		{ID: "V-3", Modified: time.Now()},
 	}
 
-	err := processEntriesParallel(context.Background(), client, st, entries, 2)
+	var failures atomic.Int64
+	err := processEntriesParallel(context.Background(), client, st, entries, 2, &failures)
 	if err != nil {
 		t.Fatalf("processEntriesParallel() error = %v", err)
 	}
@@ -206,7 +211,8 @@ func TestProcessEntriesParallel_ZeroConcurrency_FallsBackToSerial(t *testing.T) 
 		{ID: "V-2", Modified: time.Now()},
 	}
 
-	err := processEntriesParallel(context.Background(), client, st, entries, 0)
+	var failures atomic.Int64
+	err := processEntriesParallel(context.Background(), client, st, entries, 0, &failures)
 	if err != nil {
 		t.Fatalf("processEntriesParallel() error = %v", err)
 	}

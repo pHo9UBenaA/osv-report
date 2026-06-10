@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -14,9 +15,9 @@ import (
 )
 
 // processEntries fetches vulnerabilities for each entry and stores them.
-func processEntries(ctx context.Context, client Client, st FetchStore, entries []model.Entry) error {
+func processEntries(ctx context.Context, client Client, st FetchStore, entries []model.Entry, parseFailures *atomic.Int64) error {
 	for _, entry := range entries {
-		if err := processEntry(ctx, client, st, entry); err != nil {
+		if err := processEntry(ctx, client, st, entry, parseFailures); err != nil {
 			return fmt.Errorf("process entry %s: %w", entry.ID, err)
 		}
 	}
@@ -24,9 +25,9 @@ func processEntries(ctx context.Context, client Client, st FetchStore, entries [
 }
 
 // processEntriesParallel fetches vulnerabilities in parallel with controlled concurrency.
-func processEntriesParallel(ctx context.Context, client Client, st FetchStore, entries []model.Entry, maxConcurrency int) error {
+func processEntriesParallel(ctx context.Context, client Client, st FetchStore, entries []model.Entry, maxConcurrency int, parseFailures *atomic.Int64) error {
 	if maxConcurrency <= 0 {
-		return processEntries(ctx, client, st, entries)
+		return processEntries(ctx, client, st, entries, parseFailures)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -34,14 +35,14 @@ func processEntriesParallel(ctx context.Context, client Client, st FetchStore, e
 
 	for _, entry := range entries {
 		g.Go(func() error {
-			return processEntry(ctx, client, st, entry)
+			return processEntry(ctx, client, st, entry, parseFailures)
 		})
 	}
 
 	return g.Wait()
 }
 
-func processEntry(ctx context.Context, client Client, st FetchStore, entry model.Entry) error {
+func processEntry(ctx context.Context, client Client, st FetchStore, entry model.Entry, parseFailures *atomic.Int64) error {
 	vuln, err := client.GetVulnerability(ctx, entry.ID)
 	if err != nil {
 		if errors.Is(err, osv.ErrNotFound) {
@@ -50,9 +51,12 @@ func processEntry(ctx context.Context, client Client, st FetchStore, entry model
 		return fmt.Errorf("get vulnerability: %w", err)
 	}
 
-	baseScore, vector, err := model.ExtractFromOSV(vuln.Severity)
+	baseScore, vector, kind, err := model.ExtractFromOSV(vuln.Severity)
 	if err != nil {
-		slog.Debug("parse severity", "id", vuln.ID, "vector", vector, "err", err)
+		if parseFailures != nil {
+			parseFailures.Add(1)
+		}
+		slog.Warn("parse severity", "id", vuln.ID, "vector", vector, "err", err)
 	}
 
 	affected := make([]store.Affected, len(vuln.Affected))
@@ -72,6 +76,7 @@ func processEntry(ctx context.Context, client Client, st FetchStore, entry model
 		Details:           vuln.Details,
 		SeverityBaseScore: baseScore,
 		SeverityVector:    vector,
+		SeverityType:      kind,
 	}, affected); err != nil {
 		return fmt.Errorf("save vulnerability: %w", err)
 	}

@@ -20,6 +20,7 @@ func TestFormatCSV_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
 				val := 9.8
 				return &val
 			}(),
+			SeverityType:   "CVSS_V3.1",
 			SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 		},
 		{
@@ -36,15 +37,15 @@ func TestFormatCSV_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
 		t.Fatalf("FormatCSV() error = %v", err)
 	}
 
-	if !strings.Contains(result, "ecosystem,package,id,published,modified,severity_base_score,severity_vector") {
+	if !strings.Contains(result, "ecosystem,package,id,published,modified,severity_base_score,severity_type,severity_vector") {
 		t.Errorf("missing header in result")
 	}
 
-	if !strings.Contains(result, "npm,express,GHSA-xxxx-yyyy-zzzz,2025-10-01T00:00:00Z,2025-10-02T00:00:00Z,9.8,CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") {
+	if !strings.Contains(result, "npm,express,GHSA-xxxx-yyyy-zzzz,2025-10-01T00:00:00Z,2025-10-02T00:00:00Z,9.8,CVSS_V3.1,CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") {
 		t.Errorf("missing first entry in result")
 	}
 
-	if !strings.Contains(result, "PyPI,requests,GHSA-aaaa-bbbb-cccc,NA,NA,NA,NA") {
+	if !strings.Contains(result, "PyPI,requests,GHSA-aaaa-bbbb-cccc,NA,NA,NA,NA,NA") {
 		t.Errorf("missing second entry with NA values in result")
 	}
 }
@@ -137,7 +138,7 @@ func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T)
 	}
 
 	data := records[1]
-	// field 0=ecosystem, 1=package, 2=id, 6=severity_vector
+	// field 0=ecosystem, 1=package, 2=id, 6=severity_type, 7=severity_vector
 	// Each dangerous-prefix field should be escaped with a leading single quote.
 	if data[2] != "'\n=INJECT" {
 		t.Errorf("id field = %q, want %q", data[2], "'\n=INJECT")
@@ -145,7 +146,7 @@ func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T)
 	if data[1] != "'\t=cmd|'/c calc'!A1" {
 		t.Errorf("package field = %q, want %q", data[1], "'\t=cmd|'/c calc'!A1")
 	}
-	if data[6] != "'\r@ALERT" {
-		t.Errorf("severity_vector field = %q, want %q", data[6], "'\r@ALERT")
+	if data[7] != "'\r@ALERT" {
+		t.Errorf("severity_vector field = %q, want %q", data[7], "'\r@ALERT")
 	}
 }

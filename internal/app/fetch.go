@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/pHo9UBenaA/osv-report/internal/config"
@@ -104,6 +105,7 @@ func processEcosystem(ctx context.Context, eco model.Ecosystem, st FetchStore, c
 		return nil
 	}
 
+	var parseFailures atomic.Int64
 	for i := 0; i < len(entries); i += config.BatchSize {
 		end := i + config.BatchSize
 		if end > len(entries) {
@@ -113,9 +115,13 @@ func processEcosystem(ctx context.Context, eco model.Ecosystem, st FetchStore, c
 		batch := entries[i:end]
 		slog.Info("processing batch", "ecosystem", source, "batchStart", i, "batchEnd", end, "total", len(entries))
 
-		if err := processEntriesParallel(ctx, client, st, batch, config.MaxConcurrency); err != nil {
+		if err := processEntriesParallel(ctx, client, st, batch, config.MaxConcurrency, &parseFailures); err != nil {
 			return fmt.Errorf("process batch: %w", err)
 		}
+	}
+
+	if n := parseFailures.Load(); n > 0 {
+		slog.Info("severity parse failures", "ecosystem", source, "count", n)
 	}
 
 	latestModified := model.MaxModified(entries)

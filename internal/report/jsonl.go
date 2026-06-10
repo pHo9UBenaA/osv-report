@@ -18,6 +18,7 @@ func FormatJSONL(entries []VulnerabilityEntry) (string, error) {
 			"published":           formatString(e.Published),
 			"modified":            formatString(e.Modified),
 			"severity_base_score": formatBaseScore(e.SeverityBaseScore),
+			"severity_type":       formatString(e.SeverityType),
 			"severity_vector":     formatString(e.SeverityVector),
 		}
 

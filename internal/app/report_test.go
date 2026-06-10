@@ -43,6 +43,7 @@ func TestGenerateReport_FullMode_WritesReportFile(t *testing.T) {
 				Modified:       "2025-10-02T00:00:00Z",
 				SeverityScore:  ptrFloat64(9.8),
 				SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+				SeverityType:   "CVSS_V3.1",
 			},
 		},
 	}

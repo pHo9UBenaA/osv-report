@@ -14,6 +14,7 @@ type VulnerabilityEntry struct {
 	Modified          string
 	SeverityBaseScore *float64
 	SeverityVector    string
+	SeverityType      string
 }
 
 // markdownReplacer is used to escape special Markdown characters.
@@ -35,8 +36,8 @@ func FormatMarkdown(entries []VulnerabilityEntry) string {
 	var sb strings.Builder
 
 	// Write header
-	sb.WriteString("| Ecosystem | Package | ID | Published | Modified | Severity: Base Score | Severity: Vector String |\n")
-	sb.WriteString("| --- | --- | --- | --- | --- | --- | --- |\n")
+	sb.WriteString("| Ecosystem | Package | ID | Published | Modified | Severity: Base Score | Severity: Type | Severity: Vector String |\n")
+	sb.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
 
 	// Write entries
 	for _, e := range entries {
@@ -46,10 +47,11 @@ func FormatMarkdown(entries []VulnerabilityEntry) string {
 		published := escapeMarkdown(formatString(e.Published))
 		modified := escapeMarkdown(formatString(e.Modified))
 		severityBase := formatBaseScore(e.SeverityBaseScore)
+		severityType := escapeMarkdown(formatString(e.SeverityType))
 		severityVector := escapeMarkdown(formatString(e.SeverityVector))
 
-		fmt.Fprintf(&sb, "| %s | %s | %s | %s | %s | %s | %s |\n",
-			ecosystem, pkg, id, published, modified, severityBase, severityVector)
+		fmt.Fprintf(&sb, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			ecosystem, pkg, id, published, modified, severityBase, severityType, severityVector)
 	}
 
 	return sb.String()

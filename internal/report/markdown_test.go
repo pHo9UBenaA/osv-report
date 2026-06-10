@@ -19,6 +19,7 @@ func TestFormatMarkdown_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 				val := 9.8
 				return &val
 			}(),
+			SeverityType:   "CVSS_V3.1",
 			SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 		},
 		{
@@ -32,19 +33,19 @@ func TestFormatMarkdown_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 
 	result := report.FormatMarkdown(entries)
 
-	if !strings.Contains(result, "| Ecosystem | Package | ID | Published | Modified | Severity: Base Score | Severity: Vector String |") {
+	if !strings.Contains(result, "| Ecosystem | Package | ID | Published | Modified | Severity: Base Score | Severity: Type | Severity: Vector String |") {
 		t.Errorf("missing header in result")
 	}
 
-	if !strings.Contains(result, "| --- | --- | --- | --- | --- | --- | --- |") {
+	if !strings.Contains(result, "| --- | --- | --- | --- | --- | --- | --- | --- |") {
 		t.Errorf("missing separator in result")
 	}
 
-	if !strings.Contains(result, "| npm | express | GHSA-xxxx-yyyy-zzzz | 2025-10-01T00:00:00Z | 2025-10-02T00:00:00Z | 9.8 | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |") {
-		t.Errorf("missing first entry in result")
+	if !strings.Contains(result, "| npm | express | GHSA-xxxx-yyyy-zzzz | 2025-10-01T00:00:00Z | 2025-10-02T00:00:00Z | 9.8 | CVSS\\_V3.1 | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |") {
+		t.Errorf("missing first entry in result: %s", result)
 	}
 
-	if !strings.Contains(result, "| PyPI | requests | GHSA-aaaa-bbbb-cccc | NA | NA | NA | NA |") {
+	if !strings.Contains(result, "| PyPI | requests | GHSA-aaaa-bbbb-cccc | NA | NA | NA | NA | NA |") {
 		t.Errorf("missing second entry with NA values in result")
 	}
 }

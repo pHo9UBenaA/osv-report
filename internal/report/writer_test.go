@@ -40,7 +40,7 @@ func TestWriteCSV_ValidEntries_CreatesFile(t *testing.T) {
 	}
 
 	content := string(data)
-	if !strings.Contains(content, "ecosystem,package,id,published,modified,severity_base_score,severity_vector") {
+	if !strings.Contains(content, "ecosystem,package,id,published,modified,severity_base_score,severity_type,severity_vector") {
 		t.Error("output file missing CSV header")
 	}
 	if !strings.Contains(content, "GHSA-test-1234") {

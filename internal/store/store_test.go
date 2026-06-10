@@ -425,6 +425,7 @@ func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *test
 		Details:           "Details for test vulnerability 1",
 		SeverityBaseScore: ptrFloat64(9.8),
 		SeverityVector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+		SeverityType:      "CVSS_V3.1",
 	}
 	if err := s.SaveVulnerabilityWithAffected(ctx, vuln1,
 		[]store.Affected{{VulnID: vuln1.ID, Ecosystem: "npm", Package: "test-package-1"}},
@@ -473,6 +474,10 @@ func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *test
 
 	if *npmEntries[0].SeverityScore != 9.8 {
 		t.Errorf("SeverityScore = %v, want 9.8", *npmEntries[0].SeverityScore)
+	}
+
+	if npmEntries[0].SeverityType != "CVSS_V3.1" {
+		t.Errorf("SeverityType = %q, want CVSS_V3.1", npmEntries[0].SeverityType)
 	}
 }
 

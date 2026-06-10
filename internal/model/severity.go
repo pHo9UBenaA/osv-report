@@ -2,9 +2,12 @@ package model
 
 import (
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
+
+	gocvss20 "github.com/pandatix/go-cvss/20"
+	gocvss30 "github.com/pandatix/go-cvss/30"
+	gocvss31 "github.com/pandatix/go-cvss/31"
+	gocvss40 "github.com/pandatix/go-cvss/40"
 )
 
 // SeverityEntry represents severity information from OSV data.
@@ -15,130 +18,124 @@ type SeverityEntry struct {
 	Score string
 }
 
-// ExtractFromOSV extracts severity vector information and optional base score from OSV severity data.
-// It returns the computed base score (if derivable), the vector string, and an error when parsing fails.
-func ExtractFromOSV(severities []SeverityEntry) (*float64, string, error) {
-	if len(severities) == 0 {
+// selectSeverity picks the highest-priority CVSS entry from an OSV severity list.
+//
+// Priority is v4 > v3 > v2; anything else (e.g. distro-specific "Ubuntu",
+// "RedHat") is excluded. OSV's Type field only goes as far as "CVSS_V3" —
+// the minor-version distinction (3.0 vs 3.1) lives in the vector prefix,
+// so kind is refined by inspecting Score when Type is "CVSS_V3".
+func selectSeverity(severities []SeverityEntry) (selected *SeverityEntry, kind string, err error) {
+	priority := func(t string) int {
+		switch t {
+		case "CVSS_V4":
+			return 3
+		case "CVSS_V3":
+			return 2
+		case "CVSS_V2":
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	var bestIdx = -1
+	bestPriority := 0
+	for i, s := range severities {
+		p := priority(s.Type)
+		if p > bestPriority {
+			bestPriority = p
+			bestIdx = i
+		}
+	}
+
+	if bestIdx < 0 {
 		return nil, "", nil
 	}
 
-	vector := strings.TrimSpace(severities[0].Score)
+	chosen := severities[bestIdx]
+	vector := strings.TrimSpace(chosen.Score)
+	k := chosen.Type
+	switch chosen.Type {
+	case "CVSS_V4":
+		k = "CVSS_V4.0"
+	case "CVSS_V3":
+		switch {
+		case strings.HasPrefix(vector, "CVSS:3.0/"):
+			k = "CVSS_V3.0"
+		case strings.HasPrefix(vector, "CVSS:3.1/"):
+			k = "CVSS_V3.1"
+		default:
+			k = "CVSS_V3"
+		}
+	case "CVSS_V2":
+		k = "CVSS_V2"
+	}
+
+	return &chosen, k, nil
+}
+
+// ParseVector parses a CVSS vector string and returns the base score.
+// The CVSS version is determined by the vector prefix. Bare numeric scores
+// are not accepted — OSV consistently supplies a vector for CVSS entries.
+func ParseVector(vector string) (float64, error) {
+	switch {
+	case strings.HasPrefix(vector, "CVSS:2.0/"):
+		// gocvss20 expects the bare metric list — the "CVSS:2.0/" prefix is
+		// our own dispatch marker and is not part of the CVSS v2 spec.
+		v, err := gocvss20.ParseVector(strings.TrimPrefix(vector, "CVSS:2.0/"))
+		if err != nil {
+			return 0, fmt.Errorf("parse cvss v2.0 vector: %w", err)
+		}
+		return v.BaseScore(), nil
+	case strings.HasPrefix(vector, "CVSS:3.0/"):
+		v, err := gocvss30.ParseVector(vector)
+		if err != nil {
+			return 0, fmt.Errorf("parse cvss v3.0 vector: %w", err)
+		}
+		return v.BaseScore(), nil
+	case strings.HasPrefix(vector, "CVSS:3.1/"):
+		v, err := gocvss31.ParseVector(vector)
+		if err != nil {
+			return 0, fmt.Errorf("parse cvss v3.1 vector: %w", err)
+		}
+		return v.BaseScore(), nil
+	case strings.HasPrefix(vector, "CVSS:4.0/"):
+		v, err := gocvss40.ParseVector(vector)
+		if err != nil {
+			return 0, fmt.Errorf("parse cvss v4.0 vector: %w", err)
+		}
+		return v.Score(), nil
+	default:
+		return 0, fmt.Errorf("unsupported CVSS vector prefix")
+	}
+}
+
+// ExtractFromOSV picks the highest-priority CVSS entry from OSV severity data
+// and returns its base score, vector, and a kind tag (e.g. "CVSS_V3.1",
+// "CVSS_V4.0"). The kind is persisted in the database alongside the vector so
+// downstream consumers can distinguish CVSS versions without re-parsing.
+//
+// When no usable CVSS entry exists all return values are zero. When parsing
+// the chosen vector fails the vector and kind are still returned (the caller
+// can persist them even without a numeric score).
+func ExtractFromOSV(severities []SeverityEntry) (*float64, string, string, error) {
+	chosen, kind, err := selectSeverity(severities)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if chosen == nil {
+		return nil, "", "", nil
+	}
+
+	vector := strings.TrimSpace(chosen.Score)
 	if vector == "" {
-		return nil, "", nil
+		return nil, "", kind, nil
 	}
 
 	base, err := ParseVector(vector)
 	if err != nil {
-		return nil, vector, err
+		return nil, vector, kind, err
 	}
 
-	return &base, vector, nil
-}
-
-// ParseVector parses a severity vector string and returns the numeric base score when possible.
-// Supported formats currently include CVSS v3.x vectors and plain numeric scores.
-func ParseVector(vector string) (float64, error) {
-	if strings.HasPrefix(vector, "CVSS:3.") {
-		return computeCVSS3BaseScore(vector)
-	}
-
-	return strconv.ParseFloat(vector, 64)
-}
-
-func computeCVSS3BaseScore(vector string) (float64, error) {
-	parts := strings.Split(vector, "/")
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("invalid CVSS vector")
-	}
-	if !strings.HasPrefix(parts[0], "CVSS:3.") {
-		return 0, fmt.Errorf("unsupported CVSS version")
-	}
-
-	metrics := make(map[string]string, len(parts)-1)
-	for _, part := range parts[1:] {
-		kv := strings.SplitN(part, ":", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		metrics[kv[0]] = kv[1]
-	}
-
-	required := []string{"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
-	for _, key := range required {
-		if _, ok := metrics[key]; !ok {
-			return 0, fmt.Errorf("missing metric %s", key)
-		}
-	}
-
-	// CVSS v3.x metric weights from the official CVSS specification
-	avWeights := map[string]float64{"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
-	acWeights := map[string]float64{"L": 0.77, "H": 0.44}
-	uiWeights := map[string]float64{"N": 0.85, "R": 0.62}
-	ciaWeights := map[string]float64{"N": 0.0, "L": 0.22, "H": 0.56}
-
-	scopeChanged := metrics["S"] == "C"
-	prWeightsUnchanged := map[string]float64{"N": 0.85, "L": 0.62, "H": 0.27}
-	prWeightsChanged := map[string]float64{"N": 0.85, "L": 0.68, "H": 0.5}
-
-	av, ok := avWeights[metrics["AV"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid AV metric")
-	}
-	ac, ok := acWeights[metrics["AC"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid AC metric")
-	}
-	var pr float64
-	if scopeChanged {
-		var okPR bool
-		pr, okPR = prWeightsChanged[metrics["PR"]]
-		if !okPR {
-			return 0, fmt.Errorf("invalid PR metric")
-		}
-	} else {
-		var okPR bool
-		pr, okPR = prWeightsUnchanged[metrics["PR"]]
-		if !okPR {
-			return 0, fmt.Errorf("invalid PR metric")
-		}
-	}
-	ui, ok := uiWeights[metrics["UI"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid UI metric")
-	}
-	conf, ok := ciaWeights[metrics["C"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid C metric")
-	}
-	integ, ok := ciaWeights[metrics["I"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid I metric")
-	}
-	avail, ok := ciaWeights[metrics["A"]]
-	if !ok {
-		return 0, fmt.Errorf("invalid A metric")
-	}
-
-	// CVSS v3.x base score calculation formulas from the specification
-	exploitability := 8.22 * av * ac * pr * ui
-	impactSubscore := 1 - (1-conf)*(1-integ)*(1-avail)
-	if impactSubscore <= 0 {
-		return 0, nil
-	}
-
-	if scopeChanged {
-		// Scope changed formula: Impact = 7.52 * (ISS - 0.029) - 3.25 * (ISS - 0.02)^15
-		impact := 7.52*(impactSubscore-0.029) - 3.25*math.Pow(impactSubscore-0.02, 15)
-		impact = math.Max(impact, 0)
-		// BaseScore = Roundup(Minimum[(Impact + Exploitability), 10] * 1.08)
-		return roundUp1Decimal(math.Min(1.08*(impact+exploitability), 10)), nil
-	}
-
-	// Scope unchanged formula: Impact = 6.42 * ISS
-	impact := 6.42 * impactSubscore
-	return roundUp1Decimal(math.Min(impact+exploitability, 10)), nil
-}
-
-func roundUp1Decimal(val float64) float64 {
-	return math.Ceil(val*10) / 10
+	return &base, vector, kind, nil
 }

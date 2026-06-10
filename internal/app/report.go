@@ -113,6 +113,7 @@ func convertToReportEntries(rows []store.ReportRow) []report.VulnerabilityEntry 
 			Modified:          r.Modified,
 			SeverityBaseScore: r.SeverityScore,
 			SeverityVector:    r.SeverityVector,
+			SeverityType:      r.SeverityType,
 		}
 	}
 	return result
