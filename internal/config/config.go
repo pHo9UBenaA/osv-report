@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/joho/godotenv"
 
@@ -14,12 +13,10 @@ import (
 )
 
 const (
-	APIBaseURL        = "https://api.osv.dev"
+	// EcosystemsListURL is the canonical OSV ecosystem allowlist source.
+	// Used at startup to validate OSV_ECOSYSTEMS against the upstream
+	// catalog before any download begins.
 	EcosystemsListURL = "https://osv-vulnerabilities.storage.googleapis.com/ecosystems.txt"
-	RateLimit         = 10.0 // requests per second
-	MaxConcurrency    = 5
-	BatchSize         = 100
-	HTTPTimeout       = 30 * time.Second
 
 	defaultDBPath        = "./osv.db"
 	defaultRetentionDays = 7

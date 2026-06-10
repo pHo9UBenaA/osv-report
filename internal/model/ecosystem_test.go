@@ -6,67 +6,6 @@ import (
 	"github.com/pHo9UBenaA/osv-report/internal/model"
 )
 
-func TestModifiedCSVURL_EcosystemVariants(t *testing.T) {
-	cases := []struct {
-		name    string
-		eco     model.Ecosystem
-		wantURL string
-	}{
-		{
-			name:    "SimpleEcosystem_ReturnsDirectPath",
-			eco:     model.NPM,
-			wantURL: "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip",
-		},
-		{
-			name:    "EcosystemWithSpace_PercentEncodesSpace",
-			eco:     model.GitHubActions,
-			wantURL: "https://osv-vulnerabilities.storage.googleapis.com/GitHub%20Actions/all.zip",
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.eco.ModifiedCSVURL()
-			if got != tt.wantURL {
-				t.Errorf("ModifiedCSVURL() = %q, want %q", got, tt.wantURL)
-			}
-		})
-	}
-}
-
-func TestSitemapURL_EcosystemVariants(t *testing.T) {
-	cases := []struct {
-		name    string
-		eco     model.Ecosystem
-		wantURL string
-	}{
-		{
-			name:    "SimpleEcosystem_ReturnsUnmodifiedName",
-			eco:     model.NPM,
-			wantURL: "https://osv.dev/sitemap_npm.xml",
-		},
-		{
-			name:    "EcosystemWithSpace_ReplacesSpaceWithUnderscore",
-			eco:     model.GitHubActions,
-			wantURL: "https://osv.dev/sitemap_GitHub_Actions.xml",
-		},
-		{
-			name:    "EcosystemWithHyphen_PreservesHyphen",
-			eco:     model.OSSFuzz,
-			wantURL: "https://osv.dev/sitemap_OSS-Fuzz.xml",
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.eco.SitemapURL()
-			if got != tt.wantURL {
-				t.Errorf("SitemapURL() = %q, want %q", got, tt.wantURL)
-			}
-		})
-	}
-}
-
 func TestValidateEcosystems_BatchValidation(t *testing.T) {
 	allowList := []string{"npm", "PyPI", "Go"}
 

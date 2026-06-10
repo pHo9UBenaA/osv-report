@@ -62,9 +62,9 @@ func runFetch() error {
 		}
 	}()
 
-	client := osv.NewClientWithOptions(config.APIBaseURL, config.RateLimit, config.HTTPTimeout)
+	source := osv.NewUnifiedAllZipSource(st)
 	lister := osv.NewEcosystemsFetcher(config.EcosystemsListURL, nil)
-	return app.Fetch(ctx, cfg, client, st, lister)
+	return app.Fetch(ctx, cfg, source, st, lister)
 }
 
 func runReport() error {

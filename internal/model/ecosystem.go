@@ -3,7 +3,6 @@ package model
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 )
 
@@ -24,20 +23,6 @@ const (
 	NuGet         Ecosystem = "NuGet"
 	OSSFuzz       Ecosystem = "OSS-Fuzz"
 )
-
-const baseURL = "https://osv-vulnerabilities.storage.googleapis.com"
-
-// ModifiedCSVURL returns the URL for the all.zip file of this ecosystem.
-func (e Ecosystem) ModifiedCSVURL() string {
-	escapedName := url.PathEscape(string(e))
-	return fmt.Sprintf("%s/%s/all.zip", baseURL, escapedName)
-}
-
-// SitemapURL returns the URL for the OSV sitemap XML of this ecosystem.
-func (e Ecosystem) SitemapURL() string {
-	name := strings.ReplaceAll(string(e), " ", "_")
-	return fmt.Sprintf("https://osv.dev/sitemap_%s.xml", name)
-}
 
 // String returns the string representation of the ecosystem.
 func (e Ecosystem) String() string {

@@ -155,11 +155,6 @@ func (s *Store) initSchema(ctx context.Context) error {
 			severity_vector TEXT
 		);
 
-		CREATE TABLE IF NOT EXISTS tombstone (
-			id TEXT PRIMARY KEY,
-			deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
 		CREATE TABLE IF NOT EXISTS affected (
 			vuln_id TEXT NOT NULL,
 			ecosystem TEXT NOT NULL,
@@ -266,6 +261,8 @@ func (s *Store) runMigrations(ctx context.Context) error {
 			`,
 		},
 		{version: 6, sql: "ALTER TABLE vulnerability ADD COLUMN severity_type TEXT"},
+		{version: 7, sql: "DROP TABLE IF EXISTS tombstone"},
+		{version: 8, sql: "ALTER TABLE source_cursor ADD COLUMN etag TEXT"},
 	}
 
 	for _, m := range migrations {
@@ -325,6 +322,39 @@ func (s *Store) SaveCursor(ctx context.Context, source string, cursor time.Time)
 	_, err := s.db.ExecContext(ctx, query, source, cursor.UTC().Format(timeFormat))
 	if err != nil {
 		return fmt.Errorf("save cursor: %w", err)
+	}
+	return nil
+}
+
+// GetETag retrieves the ETag stored alongside a source cursor, or empty
+// string if no row or no ETag exists yet.
+func (s *Store) GetETag(ctx context.Context, source string) (string, error) {
+	var etag sql.NullString
+	err := s.db.QueryRowContext(ctx, "SELECT etag FROM source_cursor WHERE source = ?", source).Scan(&etag)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get etag: %w", err)
+	}
+	if !etag.Valid {
+		return "", nil
+	}
+	return etag.String, nil
+}
+
+// SaveETag records the ETag returned by the upstream HTTP server. The
+// cursor row is created on first call (with an empty cursor string) so
+// the unified source can store ETag-only state without a meaningful
+// timestamp.
+func (s *Store) SaveETag(ctx context.Context, source, etag string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO source_cursor (source, cursor, etag)
+		VALUES (?, '', ?)
+		ON CONFLICT(source) DO UPDATE SET etag = excluded.etag
+	`, source, etag)
+	if err != nil {
+		return fmt.Errorf("save etag: %w", err)
 	}
 	return nil
 }
@@ -426,16 +456,12 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 	})
 }
 
-// SaveTombstone records a deleted vulnerability ID.
-func (s *Store) SaveTombstone(ctx context.Context, id string) error {
-	query := `
-		INSERT INTO tombstone (id)
-		VALUES (?)
-		ON CONFLICT(id) DO NOTHING
-	`
-	_, err := s.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return fmt.Errorf("save tombstone: %w", err)
+// DeleteVulnerability removes a vulnerability and (via ON DELETE CASCADE
+// on the affected table) its package rows. Used when the upstream marks
+// a record as withdrawn or returns 404.
+func (s *Store) DeleteVulnerability(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM vulnerability WHERE id = ?", id); err != nil {
+		return fmt.Errorf("delete vulnerability: %w", err)
 	}
 	return nil
 }

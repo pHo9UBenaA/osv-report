@@ -331,18 +331,31 @@ func TestSaveVulnerabilityWithAffected_SingleAffected_Persists(t *testing.T) {
 	}
 }
 
-func TestSaveTombstone_NewAndDuplicate_PersistsIdempotently(t *testing.T) {
+func TestDeleteVulnerability_PresentAndAbsent_BothSucceed(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	id := "GHSA-deleted-vuln"
-
-	if err := s.SaveTombstone(ctx, id); err != nil {
-		t.Fatalf("SaveTombstone() error = %v", err)
+	v := store.Vulnerability{ID: "GHSA-deleted-vuln", Modified: time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: v.ID, Ecosystem: "npm", Package: "p"}}); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 
-	if err := s.SaveTombstone(ctx, id); err != nil {
-		t.Fatalf("SaveTombstone() second call error = %v", err)
+	if err := s.DeleteVulnerability(ctx, v.ID); err != nil {
+		t.Fatalf("delete present: %v", err)
+	}
+
+	// CASCADE should have removed the affected row too.
+	rows, err := s.GetVulnerabilitiesForReport(ctx, "")
+	if err != nil {
+		t.Fatalf("query after delete: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows after delete + CASCADE, got %d", len(rows))
+	}
+
+	// Deleting an absent id is a no-op, not an error.
+	if err := s.DeleteVulnerability(ctx, "GHSA-never-existed"); err != nil {
+		t.Errorf("delete absent should not error, got %v", err)
 	}
 }
 
