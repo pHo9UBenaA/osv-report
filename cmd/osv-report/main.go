@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
 	if len(os.Args) < 2 {
@@ -95,6 +95,10 @@ func runReport() error {
 			slog.Error("close store", "error", err)
 		}
 	}()
+
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
 
 	return app.GenerateReport(ctx, st, app.ReportOptions{
 		Format:     *format,

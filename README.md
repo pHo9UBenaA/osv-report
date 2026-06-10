@@ -1,5 +1,7 @@
 # OSV Report
 
+> **PILOT VERSION** — not yet reviewed by contributors. Use with caution.
+
 Fetches vulnerability data directly from the [OSV](https://osv.dev/) ecosystem, stores it locally in SQLite, and generates snapshot or differential reports for ecosystems such as npm, PyPI, Go, and Maven.
 
 ## What this tool does
@@ -30,7 +32,7 @@ task fetch
 task report-markdown
 ```
 
-Reports are written under `./reports/` by default.
+The Taskfile wrappers write reports under `./reports/` (via `--output-dir=./reports/`). When invoking the CLI directly, the default `--output-dir` is the current directory (`.`).
 
 ## How it works
 
@@ -46,9 +48,10 @@ The tool follows a simple lifecycle:
 
 * Loads configuration from `.env` / environment variables (`OSV_ECOSYSTEMS`, `OSV_DB_PATH`, `OSV_DATA_RETENTION_DAYS`).
 * For each ecosystem, reads the last processed cursor from `source_cursor` and fetches the ecosystem sitemap.
-* Extracts `(vulnerability ID, lastmod)` from the sitemap and keeps only entries newer than the cursor and within the retention window (`OSV_DATA_RETENTION_DAYS`).
+* Extracts `(vulnerability ID, lastmod)` from the sitemap and keeps only entries newer than the cursor.
 * Fetches vulnerability details from `GET /v1/vulns/{id}` with rate limiting (10 req/s), retry-on-429, batches of 100, and bounded parallelism (5 concurrent).
 * If the OSV API returns 404 for an ID, records it as a tombstone.
+* After the fetch completes, rows older than `OSV_DATA_RETENTION_DAYS` are deleted to keep the database bounded.
 
 ### Store phase
 
@@ -61,8 +64,8 @@ The tool follows a simple lifecycle:
 
 * Reads from SQLite by joining `vulnerability` and `affected`, ordered by published/modified time, optionally filtered by ecosystem.
 * Writes Markdown / CSV / JSONL reports to the output directory as `prefix_YYYYMMDDThhmmssZ.ext` (UTC timestamp).
-* Snapshot reports emit the current rows in the DB; diff reports emit only rows that are new or changed compared to `reported_snapshot`.
-* After a diff report is written, `reported_snapshot` is cleared and rebuilt from the current query result (use consistent ecosystem filters between diff runs).
+* Snapshot reports emit the current rows in the DB.
+* Diff reports advance a per-ecosystem watermark, so consecutive diff runs only emit rows changed since the last report.
 
 </details>
 

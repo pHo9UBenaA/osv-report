@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 	"time"
@@ -32,7 +34,9 @@ type Config struct {
 
 // Load loads configuration from environment variables.
 func Load() (*Config, error) {
-	_ = godotenv.Load()
+	if err := godotenv.Load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("load .env: %w", err)
+	}
 
 	ecosystems := model.ParseEcosystems(os.Getenv("OSV_ECOSYSTEMS"))
 

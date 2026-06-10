@@ -35,8 +35,5 @@ EXAMPLES
 
 LEARN MORE
   Read the manual at https://github.com/pHo9UBenaA/osv-report/
-
-NOTE
-  PILOT VERSION — not yet reviewed by contributors. Use with caution.
 `)
 }
