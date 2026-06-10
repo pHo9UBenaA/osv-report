@@ -163,6 +163,11 @@ func (s *Store) initSchema(ctx context.Context) error {
 			PRIMARY KEY (vuln_id, ecosystem, package)
 		);
 
+		-- reported_snapshot is intentionally kept in the base schema even
+		-- though migration v5 drops it. Fresh DBs replay every migration in
+		-- order, and v5's INSERT...FROM reported_snapshot needs the table
+		-- to exist. Removing this CREATE without first removing migration
+		-- v5 would break fresh-DB initialization.
 		CREATE TABLE IF NOT EXISTS reported_snapshot (
 			id TEXT NOT NULL,
 			ecosystem TEXT NOT NULL,
@@ -263,6 +268,39 @@ func (s *Store) runMigrations(ctx context.Context) error {
 		{version: 6, sql: "ALTER TABLE vulnerability ADD COLUMN severity_type TEXT"},
 		{version: 7, sql: "DROP TABLE IF EXISTS tombstone"},
 		{version: 8, sql: "ALTER TABLE source_cursor ADD COLUMN etag TEXT"},
+		{
+			// v9: truncate source_cursor. Every pre-rev5 row is potentially
+			// compromised:
+			//
+			//   (a) cursor='' rows came from rev4's bare SaveETag and may
+			//       seal content that was never ingested (bug #2).
+			//   (b) Even rev4 rows that look healthy (cursor + etag both set)
+			//       are unreliable: rev4's cursor silently advanced past
+			//       decode-failed entries (bug #4), so a "processed" cursor
+			//       may have skipped records that never landed in the DB.
+			//   (c) Pre-F per-ecosystem rows are unreachable under the
+			//       unified Source and would leak forever.
+			//
+			// We cannot distinguish (a)/(b)/(c) from a truly healthy row by
+			// inspecting it. The "trade re-download cost for never-skip
+			// risk" principle (Q1) is applied uniformly: drop everything
+			// and force one full refetch. UPSERTs are idempotent and the
+			// CASE-guarded fetched_at (D4) keeps the diff stable.
+			//
+			// As a welcome side effect, this migration no longer mentions
+			// the '__unified__' literal, so it cannot drift from
+			// osv.UnifiedSourceCursorKey.
+			version: 9,
+			sql:     "DELETE FROM source_cursor",
+		},
+		{
+			// v10: store the configured-ecosystem fingerprint alongside the
+			// cursor/etag so app.Fetch can detect a config change and force
+			// a full refetch. Backfill is not needed because v9 just emptied
+			// the table.
+			version: 10,
+			sql:     "ALTER TABLE source_cursor ADD COLUMN ecosystems TEXT",
+		},
 	}
 
 	for _, m := range migrations {
@@ -312,75 +350,80 @@ func (s *Store) runMigrations(ctx context.Context) error {
 	return nil
 }
 
-// SaveCursor saves the cursor for a given source.
-func (s *Store) SaveCursor(ctx context.Context, source string, cursor time.Time) error {
-	query := `
-		INSERT INTO source_cursor (source, cursor)
-		VALUES (?, ?)
-		ON CONFLICT(source) DO UPDATE SET cursor = excluded.cursor
-	`
-	_, err := s.db.ExecContext(ctx, query, source, cursor.UTC().Format(timeFormat))
-	if err != nil {
-		return fmt.Errorf("save cursor: %w", err)
-	}
-	return nil
+// SourceState bundles every column a caller can read or write on the
+// source_cursor row for a given source. The zero value represents an
+// unregistered source (no cursor, no etag, no ecosystem fingerprint).
+//
+// All three fields move together: GetSourceState and SaveSourceState are
+// the only public way to touch the row, so a partial write that leaves
+// the cursor blank (rev4's SaveETag bug) is structurally impossible.
+type SourceState struct {
+	Cursor     time.Time
+	ETag       string
+	Ecosystems string
 }
 
-// GetETag retrieves the ETag stored alongside a source cursor, or empty
-// string if no row or no ETag exists yet.
-func (s *Store) GetETag(ctx context.Context, source string) (string, error) {
-	var etag sql.NullString
-	err := s.db.QueryRowContext(ctx, "SELECT etag FROM source_cursor WHERE source = ?", source).Scan(&etag)
+// GetSourceState returns the persisted state for a source. A missing row
+// is reported as the zero value with a nil error — sql.ErrNoRows never
+// escapes the store, so callers don't have to special-case it.
+//
+// The cursor TEXT is parsed strictly: empty strings or any non-RFC3339
+// content return an error. This refuses to launder corrupt rows into the
+// "fresh start" path; the runbook tells operators to DELETE the row
+// instead when they hit it.
+func (s *Store) GetSourceState(ctx context.Context, source string) (SourceState, error) {
+	var (
+		cursorStr  string
+		etag       sql.NullString
+		ecosystems sql.NullString
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT cursor, etag, ecosystems
+		FROM source_cursor
+		WHERE source = ?
+	`, source).Scan(&cursorStr, &etag, &ecosystems)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
+			return SourceState{}, nil
 		}
-		return "", fmt.Errorf("get etag: %w", err)
-	}
-	if !etag.Valid {
-		return "", nil
-	}
-	return etag.String, nil
-}
-
-// SaveETag records the ETag returned by the upstream HTTP server. The
-// cursor row is created on first call (with an empty cursor string) so
-// the unified source can store ETag-only state without a meaningful
-// timestamp.
-func (s *Store) SaveETag(ctx context.Context, source, etag string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO source_cursor (source, cursor, etag)
-		VALUES (?, '', ?)
-		ON CONFLICT(source) DO UPDATE SET etag = excluded.etag
-	`, source, etag)
-	if err != nil {
-		return fmt.Errorf("save etag: %w", err)
-	}
-	return nil
-}
-
-// GetCursor retrieves the cursor for a given source.
-// Returns sql.ErrNoRows directly if no cursor exists for the source,
-// allowing callers to distinguish "no cursor yet" from database errors.
-func (s *Store) GetCursor(ctx context.Context, source string) (time.Time, error) {
-	query := `SELECT cursor FROM source_cursor WHERE source = ?`
-	var cursorStr string
-	err := s.db.QueryRowContext(ctx, query, source).Scan(&cursorStr)
-	if err != nil {
-		// Return sql.ErrNoRows directly to allow caller to distinguish
-		// "no cursor found" from actual database errors
-		if errors.Is(err, sql.ErrNoRows) {
-			return time.Time{}, sql.ErrNoRows
-		}
-		return time.Time{}, fmt.Errorf("get cursor: %w", err)
+		return SourceState{}, fmt.Errorf("get source state: %w", err)
 	}
 
 	cursor, err := time.Parse(timeFormat, cursorStr)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parse cursor: %w", err)
+		return SourceState{}, fmt.Errorf("parse cursor: %w", err)
 	}
 
-	return cursor, nil
+	return SourceState{
+		Cursor:     cursor,
+		ETag:       etag.String,
+		Ecosystems: ecosystems.String,
+	}, nil
+}
+
+// SaveSourceState writes all three columns in one statement, so the
+// caller cannot accidentally advance the ETag without also committing a
+// matching cursor (the source of bug #1 in rev4). The zero time
+// serialises to "0001-01-01T00:00:00Z", which round-trips through
+// GetSourceState and reports IsZero() = true.
+func (s *Store) SaveSourceState(ctx context.Context, source string, st SourceState) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO source_cursor (source, cursor, etag, ecosystems)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(source) DO UPDATE SET
+			cursor = excluded.cursor,
+			etag = excluded.etag,
+			ecosystems = excluded.ecosystems
+	`,
+		source,
+		st.Cursor.UTC().Format(timeFormat),
+		toNullString(st.ETag),
+		toNullString(st.Ecosystems),
+	)
+	if err != nil {
+		return fmt.Errorf("save source state: %w", err)
+	}
+	return nil
 }
 
 // SaveVulnerabilityWithAffected upserts a vulnerability and replaces its
@@ -395,7 +438,10 @@ func (s *Store) GetCursor(ctx context.Context, source string) (time.Time, error)
 // fetched_at is stamped here from s.clock, not from the caller, so the
 // watermark axis is decoupled from the OSV-supplied modified timestamp.
 // That decoupling prevents records whose modified is older than the
-// previous watermark from being silently skipped on re-fetch.
+// previous watermark from being silently skipped on re-fetch. The CASE
+// in the UPSERT preserves the old fetched_at when the upstream modified
+// has not changed, so re-ingesting an unchanged record does not flood
+// the diff report on retry.
 func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerability, affected []Affected) error {
 	publishedParam := any(nil)
 	if !v.Published.IsZero() {
@@ -415,7 +461,11 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 				severity_base_score = excluded.severity_base_score,
 				severity_vector = excluded.severity_vector,
 				severity_type = excluded.severity_type,
-				fetched_at = excluded.fetched_at
+				fetched_at = CASE
+					WHEN vulnerability.modified != excluded.modified
+					THEN excluded.fetched_at
+					ELSE vulnerability.fetched_at
+				END
 		`,
 			v.ID,
 			v.Modified.UTC().Format(timeFormat),
@@ -532,36 +582,17 @@ func (s *Store) GetVulnerabilitiesForReport(ctx context.Context, ecosystem strin
 	return scanReportRows(rows)
 }
 
-// DeleteVulnerabilitiesOlderThan deletes vulnerabilities and related data older than the cutoff time.
+// DeleteVulnerabilitiesOlderThan deletes vulnerabilities (and, via the
+// ON DELETE CASCADE added by migration v2, their affected rows) whose
+// modified is before cutoff. The single-statement form relies on the
+// CASCADE FK; the older two-step DELETE was a leftover from before the
+// CASCADE migration and keeping it would mean retention used a different
+// deletion mechanism than the withdrawn path.
 func (s *Store) DeleteVulnerabilitiesOlderThan(ctx context.Context, cutoff time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
 	cutoffStr := cutoff.UTC().Format(timeFormat)
-
-	// Delete affected records for old vulnerabilities
-	_, err = tx.ExecContext(ctx, `
-		DELETE FROM affected WHERE vuln_id IN (
-			SELECT id FROM vulnerability WHERE modified < ?
-		)
-	`, cutoffStr)
-	if err != nil {
-		return fmt.Errorf("delete old affected records: %w", err)
-	}
-
-	// Delete old vulnerabilities
-	_, err = tx.ExecContext(ctx, `DELETE FROM vulnerability WHERE modified < ?`, cutoffStr)
-	if err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM vulnerability WHERE modified < ?`, cutoffStr); err != nil {
 		return fmt.Errorf("delete old vulnerabilities: %w", err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
-
 	return nil
 }
 

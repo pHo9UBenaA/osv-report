@@ -24,37 +24,26 @@ const UnifiedSourceCursorKey = "__unified__"
 
 const defaultAllZipHTTPTimeout = 30 * time.Minute
 
-// ETagStorage is the persistence dependency UnifiedAllZipSource needs
-// to drive its If-None-Match optimization. A real implementation lives
-// in the store package, but the Source itself doesn't import it — any
-// type providing these two methods works, which keeps the dependency
-// graph store→osv-free.
-type ETagStorage interface {
-	GetETag(ctx context.Context, source string) (string, error)
-	SaveETag(ctx context.Context, source, etag string) error
-}
-
-// UnifiedAllZipSource downloads the OSV unified all.zip, sends an
-// If-None-Match request to avoid re-downloading unchanged data, and
+// UnifiedAllZipSource downloads the OSV unified all.zip, optionally
+// sending If-None-Match to avoid re-downloading unchanged data, and
 // yields one SourceEvent per JSON entry. The download lands in a temp
 // file (~1.2 GiB as of the 0-S spike) because random-access reading of
 // the zip's central directory is the only practical way to iterate it.
+//
+// State persistence (ETag, cursor) is the caller's responsibility — see
+// app.Fetch. This keeps the Source free of any database dependency.
 type UnifiedAllZipSource struct {
 	url        string
 	httpClient *http.Client
-	etagStore  ETagStorage
-	cursorKey  string
 }
 
 // NewUnifiedAllZipSource constructs a source pointing at the canonical
 // unified all.zip URL. Override the URL via UnifiedSourceOptions for
 // tests.
-func NewUnifiedAllZipSource(etagStore ETagStorage, opts ...UnifiedSourceOption) *UnifiedAllZipSource {
+func NewUnifiedAllZipSource(opts ...UnifiedSourceOption) *UnifiedAllZipSource {
 	s := &UnifiedAllZipSource{
 		url:        UnifiedAllZipURL,
 		httpClient: &http.Client{Timeout: defaultAllZipHTTPTimeout},
-		etagStore:  etagStore,
-		cursorKey:  UnifiedSourceCursorKey,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -76,26 +65,26 @@ func WithUnifiedHTTPClient(client *http.Client) UnifiedSourceOption {
 	return func(s *UnifiedAllZipSource) { s.httpClient = client }
 }
 
-// Fetch downloads (or skips, on 304) the unified all.zip and returns an
-// iterator over its records. Records with modified <= cursor are
-// filtered out; the caller can ignore the cursor argument by passing
-// time.Time{}.
+// Fetch downloads (or skips, on 304) the unified all.zip and returns
+// the result the caller commits at the end of the run.
+//
+// A zip-open failure is fatal and reported as a non-nil error here so
+// the caller treats it as "no state advance" instead of consuming a
+// per-event error from an iterator that has nothing to give. Per-entry
+// decode errors come through the iterator the usual way.
 //
 // The returned iterator owns the temp file: it deletes the file when
-// iteration completes. Callers must consume the iterator to completion
-// (or abandon it via early return — the file is still cleaned up at
-// process exit if the temp dir is cleaned).
-func (s *UnifiedAllZipSource) Fetch(ctx context.Context, cursor time.Time) (iter.Seq2[SourceEvent, error], error) {
-	prevETag, err := s.etagStore.GetETag(ctx, s.cursorKey)
-	if err != nil {
-		return nil, fmt.Errorf("get previous etag: %w", err)
-	}
-
+// iteration completes or is abandoned via early return. Callers should
+// consume the iterator even on a context cancel so the cleanup runs.
+func (s *UnifiedAllZipSource) Fetch(ctx context.Context, cursor time.Time, prevETag string) (*FetchResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	if prevETag != "" {
+		// Source.Fetch contract: only attach If-None-Match when a previous
+		// ETag is known. Sending an empty value makes the upstream answer
+		// 200 every time, which is worse than not sending it at all.
 		req.Header.Set("If-None-Match", prevETag)
 	}
 
@@ -107,8 +96,9 @@ func (s *UnifiedAllZipSource) Fetch(ctx context.Context, cursor time.Time) (iter
 	switch resp.StatusCode {
 	case http.StatusNotModified:
 		resp.Body.Close() //nolint:errcheck
-		// 304 means "nothing changed"; the iterator emits nothing.
-		return emptySeq, nil
+		// 304: ETag must be empty (contract pinned by tests) so callers
+		// keep their previously persisted value.
+		return &FetchResult{Events: emptySeq, ETag: "", NotModified: true}, nil
 	case http.StatusOK:
 		// fall through
 	default:
@@ -122,16 +112,20 @@ func (s *UnifiedAllZipSource) Fetch(ctx context.Context, cursor time.Time) (iter
 		return nil, fmt.Errorf("drain body: %w", err)
 	}
 
-	newETag := resp.Header.Get("ETag")
-	if newETag != "" {
-		if err := s.etagStore.SaveETag(ctx, s.cursorKey, newETag); err != nil {
-			os.Remove(tmp.Name()) //nolint:errcheck
-			tmp.Close()           //nolint:errcheck
-			return nil, fmt.Errorf("save etag: %w", err)
-		}
+	// Open the zip eagerly so a truncated / corrupt download becomes a
+	// Fetch-level error rather than a single per-entry error the caller
+	// might swallow as "just one bad record".
+	zr, err := zip.NewReader(tmp, size)
+	if err != nil {
+		tmp.Close()           //nolint:errcheck
+		os.Remove(tmp.Name()) //nolint:errcheck
+		return nil, fmt.Errorf("open zip: %w", err)
 	}
 
-	return newZipSeq(tmp, size, cursor), nil
+	return &FetchResult{
+		Events: zipSeqFromReader(ctx, zr, tmp, cursor),
+		ETag:   resp.Header.Get("ETag"),
+	}, nil
 }
 
 // emptySeq is the no-event iterator used when the server returns 304.
@@ -160,24 +154,25 @@ func drainToTemp(r io.Reader) (*os.File, int64, error) {
 	return tmp, n, nil
 }
 
-// newZipSeq returns an iterator that decodes one rawVulnerability per
-// zip entry, filters by cursor, and yields SourceEvents. The temp file
-// is deleted when iteration finishes (or when the iterator is closed
-// early via break).
-func newZipSeq(tmp *os.File, size int64, cursor time.Time) iter.Seq2[SourceEvent, error] {
+// zipSeqFromReader iterates an already-opened zip reader, decoding one
+// rawVulnerability per entry, filtering by cursor, and yielding
+// SourceEvents. The temp file is closed and deleted when iteration
+// finishes (or when the iterator is closed early via break).
+//
+// ctx.Err is checked at the top of every entry so a long decode loop
+// honours Ctrl-C even though the HTTP download is already complete.
+func zipSeqFromReader(ctx context.Context, zr *zip.Reader, tmp *os.File, cursor time.Time) iter.Seq2[SourceEvent, error] {
 	return func(yield func(SourceEvent, error) bool) {
 		defer func() {
 			tmp.Close()           //nolint:errcheck
 			os.Remove(tmp.Name()) //nolint:errcheck
 		}()
 
-		zr, err := zip.NewReader(tmp, size)
-		if err != nil {
-			yield(SourceEvent{}, fmt.Errorf("open zip: %w", err))
-			return
-		}
-
 		for _, file := range zr.File {
+			if err := ctx.Err(); err != nil {
+				yield(SourceEvent{}, err)
+				return
+			}
 			if file.FileInfo().IsDir() {
 				continue
 			}
@@ -202,6 +197,8 @@ func newZipSeq(tmp *os.File, size int64, cursor time.Time) iter.Seq2[SourceEvent
 // decodeZipEntry reads a single JSON file from the zip and converts it
 // to a SourceEvent. Returns ev with zero ID if the record is filtered
 // out by cursor (so the caller can distinguish "skip" from "emit").
+// Both active and withdrawn events carry Modified so the cursor
+// machinery can advance off either path.
 func decodeZipEntry(file *zip.File, cursor time.Time) (SourceEvent, error) {
 	rc, err := file.Open()
 	if err != nil {
@@ -223,7 +220,7 @@ func decodeZipEntry(file *zip.File, cursor time.Time) (SourceEvent, error) {
 	}
 
 	if !raw.Withdrawn.IsZero() {
-		return SourceEvent{ID: raw.ID, Withdrawn: true}, nil
+		return SourceEvent{ID: raw.ID, Modified: raw.Modified, Withdrawn: true}, nil
 	}
-	return SourceEvent{ID: raw.ID, Vuln: normalize(&raw)}, nil
+	return SourceEvent{ID: raw.ID, Modified: raw.Modified, Vuln: normalize(&raw)}, nil
 }

@@ -5,38 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 )
-
-// memoryETagStorage implements ETagStorage entirely in memory; used by
-// the unified-source tests so they don't depend on the SQLite store.
-type memoryETagStorage struct {
-	mu      sync.Mutex
-	storage map[string]string
-}
-
-func newMemoryETagStorage() *memoryETagStorage {
-	return &memoryETagStorage{storage: map[string]string{}}
-}
-
-func (m *memoryETagStorage) GetETag(_ context.Context, source string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.storage[source], nil
-}
-
-func (m *memoryETagStorage) SaveETag(_ context.Context, source, etag string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.storage[source] = etag
-	return nil
-}
 
 // buildOSVZip writes a zip with one JSON entry per supplied raw record,
 // suitable for serving from httptest.
@@ -59,7 +33,22 @@ func buildOSVZip(t *testing.T, records []rawVulnerability) []byte {
 	return buf.Bytes()
 }
 
-func TestUnifiedAllZipSource_200_YieldsEvents(t *testing.T) {
+// drainEvents collects every event from a FetchResult, failing the test
+// on any iterator error so individual tests stay focused on their
+// happy-path assertions.
+func drainEvents(t *testing.T, result *FetchResult) []SourceEvent {
+	t.Helper()
+	var out []SourceEvent
+	for ev, err := range result.Events {
+		if err != nil {
+			t.Fatalf("event err: %v", err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestUnifiedAllZipSource_200_ReturnsETag(t *testing.T) {
 	t0 := time.Date(2025, 10, 1, 12, 0, 0, 0, time.UTC)
 	records := []rawVulnerability{
 		{ID: "GHSA-1", Modified: t0, Affected: []rawAffected{{Package: rawPackage{Ecosystem: "npm", Name: "a"}}}},
@@ -77,64 +66,82 @@ func TestUnifiedAllZipSource_200_YieldsEvents(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	store := newMemoryETagStorage()
-	src := NewUnifiedAllZipSource(store, WithUnifiedURL(srv.URL))
-
-	seq, err := src.Fetch(context.Background(), time.Time{})
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	result, err := src.Fetch(context.Background(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-
-	gotIDs := map[string]SourceEvent{}
-	for ev, err := range seq {
-		if err != nil {
-			t.Fatalf("event err: %v", err)
-		}
-		gotIDs[ev.ID] = ev
+	if result.NotModified {
+		t.Errorf("200 should not set NotModified")
+	}
+	if result.ETag != wantETag {
+		t.Errorf("ETag = %q, want %q", result.ETag, wantETag)
 	}
 
-	if len(gotIDs) != 3 {
-		t.Fatalf("got %d events, want 3", len(gotIDs))
-	}
-	if gotIDs["GHSA-3"].Withdrawn != true || gotIDs["GHSA-3"].Vuln != nil {
-		t.Errorf("GHSA-3 should be withdrawn, got %+v", gotIDs["GHSA-3"])
-	}
-	if gotIDs["GHSA-1"].Vuln == nil || gotIDs["GHSA-1"].Vuln.Affected[0].Ecosystem != "npm" {
-		t.Errorf("GHSA-1 affected mismatch: %+v", gotIDs["GHSA-1"])
+	events := drainEvents(t, result)
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3", len(events))
 	}
 
-	if got, _ := store.GetETag(context.Background(), UnifiedSourceCursorKey); got != wantETag {
-		t.Errorf("etag stored = %q, want %q", got, wantETag)
+	byID := map[string]SourceEvent{}
+	for _, ev := range events {
+		byID[ev.ID] = ev
+	}
+	if byID["GHSA-3"].Withdrawn != true || byID["GHSA-3"].Vuln != nil {
+		t.Errorf("GHSA-3 should be withdrawn, got %+v", byID["GHSA-3"])
+	}
+	if byID["GHSA-3"].Modified.IsZero() {
+		t.Errorf("withdrawn event should still carry Modified, got zero")
+	}
+	if byID["GHSA-1"].Vuln == nil || byID["GHSA-1"].Vuln.Affected[0].Ecosystem != "npm" {
+		t.Errorf("GHSA-1 affected mismatch: %+v", byID["GHSA-1"])
 	}
 }
 
-func TestUnifiedAllZipSource_304_YieldsNothingAndKeepsETag(t *testing.T) {
-	const etag = `"abc"`
+func TestUnifiedAllZipSource_304_SetsNotModified(t *testing.T) {
+	const prev = `"abc"`
 	var seenIfNoneMatch string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenIfNoneMatch = r.Header.Get("If-None-Match")
-		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusNotModified)
 	}))
 	defer srv.Close()
 
-	store := newMemoryETagStorage()
-	_ = store.SaveETag(context.Background(), UnifiedSourceCursorKey, etag)
-
-	src := NewUnifiedAllZipSource(store, WithUnifiedURL(srv.URL))
-	seq, err := src.Fetch(context.Background(), time.Time{})
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	result, err := src.Fetch(context.Background(), time.Time{}, prev)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	for ev, err := range seq {
-		t.Fatalf("expected no events from 304, got %+v err=%v", ev, err)
+	if !result.NotModified {
+		t.Errorf("304 should set NotModified")
 	}
-	if seenIfNoneMatch != etag {
-		t.Errorf("server did not see If-None-Match: got %q want %q", seenIfNoneMatch, etag)
+	if result.ETag != "" {
+		t.Errorf("304 must leave ETag empty so callers do not overwrite their saved value, got %q", result.ETag)
 	}
-	if got, _ := store.GetETag(context.Background(), UnifiedSourceCursorKey); got != etag {
-		t.Errorf("etag mutated to %q, want %q", got, etag)
+	if events := drainEvents(t, result); len(events) != 0 {
+		t.Errorf("304 must yield no events, got %d", len(events))
+	}
+	if seenIfNoneMatch != prev {
+		t.Errorf("If-None-Match = %q, want %q", seenIfNoneMatch, prev)
+	}
+}
+
+func TestUnifiedAllZipSource_CorruptZip_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"corrupt"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("definitely not a zip file"))
+	}))
+	defer srv.Close()
+
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	result, err := src.Fetch(context.Background(), time.Time{}, "")
+	if err == nil {
+		t.Fatalf("expected fatal error for corrupt zip, got result=%+v", result)
+	}
+	if result != nil {
+		t.Errorf("result must be nil on fatal Fetch error, got %+v", result)
 	}
 }
 
@@ -152,19 +159,15 @@ func TestUnifiedAllZipSource_CursorFiltersBelowAndEqual(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	store := newMemoryETagStorage()
-	src := NewUnifiedAllZipSource(store, WithUnifiedURL(srv.URL))
-
-	seq, err := src.Fetch(context.Background(), t0)
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	result, err := src.Fetch(context.Background(), t0, "")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
+	events := drainEvents(t, result)
 	var ids []string
-	for ev, err := range seq {
-		if err != nil {
-			t.Fatalf("event err: %v", err)
-		}
+	for _, ev := range events {
 		ids = append(ids, ev.ID)
 	}
 	if len(ids) != 1 || ids[0] != "new" {
@@ -178,9 +181,29 @@ func TestUnifiedAllZipSource_NonOKNon304_Errors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := NewUnifiedAllZipSource(newMemoryETagStorage(), WithUnifiedURL(srv.URL))
-	if _, err := src.Fetch(context.Background(), time.Time{}); err == nil {
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	if _, err := src.Fetch(context.Background(), time.Time{}, ""); err == nil {
 		t.Fatal("expected error for 500 response")
+	}
+}
+
+func TestUnifiedAllZipSource_NoPrevETag_OmitsIfNoneMatch(t *testing.T) {
+	var headerSent bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["If-None-Match"]; ok {
+			headerSent = true
+		}
+		w.Header().Set("ETag", `"a"`)
+		_, _ = w.Write(buildOSVZip(t, nil))
+	}))
+	defer srv.Close()
+
+	src := NewUnifiedAllZipSource(WithUnifiedURL(srv.URL))
+	if _, err := src.Fetch(context.Background(), time.Time{}, ""); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if headerSent {
+		t.Errorf("If-None-Match should not be sent when prevETag is empty")
 	}
 }
 
@@ -208,5 +231,4 @@ func TestBuildOSVZip_RoundTrips(t *testing.T) {
 	if !bytes.Contains(body, []byte(`"id":"X"`)) {
 		t.Errorf("entry missing id: %s", body)
 	}
-	_ = fmt.Sprintf // keep imports stable
 }

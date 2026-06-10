@@ -133,55 +133,281 @@ func TestNewStore_ValidPath_CreatesDatabaseFile(t *testing.T) {
 	}
 }
 
-func TestSaveThenGetCursor_ReturnsSavedTimestamp(t *testing.T) {
+// TestSourceState_RoundTrip pins that Save then Get returns the same
+// state, including the zero-value case. time.Time{} serialises to
+// "0001-01-01T00:00:00Z" which round-trips through strict RFC3339
+// parsing and reports IsZero() = true; that's the structural reason
+// the rev4 cursor='' poison row cannot recur under the new API.
+func TestSourceState_RoundTrip(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	source := "test-ecosystem"
-	cursor := time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC)
+	t.Run("PopulatedState", func(t *testing.T) {
+		want := store.SourceState{
+			Cursor:     time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC),
+			ETag:       `"v1-etag"`,
+			Ecosystems: "npm\nPyPI",
+		}
+		if err := s.SaveSourceState(ctx, "populated", want); err != nil {
+			t.Fatalf("SaveSourceState: %v", err)
+		}
+		got, err := s.GetSourceState(ctx, "populated")
+		if err != nil {
+			t.Fatalf("GetSourceState: %v", err)
+		}
+		if !got.Cursor.Equal(want.Cursor) || got.ETag != want.ETag || got.Ecosystems != want.Ecosystems {
+			t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
+		}
+	})
 
-	if err := s.SaveCursor(ctx, source, cursor); err != nil {
-		t.Fatalf("SaveCursor() error = %v", err)
-	}
+	t.Run("ZeroValue", func(t *testing.T) {
+		if err := s.SaveSourceState(ctx, "zero", store.SourceState{}); err != nil {
+			t.Fatalf("SaveSourceState zero: %v", err)
+		}
+		got, err := s.GetSourceState(ctx, "zero")
+		if err != nil {
+			t.Fatalf("GetSourceState zero: %v", err)
+		}
+		if !got.Cursor.IsZero() {
+			t.Errorf("zero cursor round trip failed: got %v", got.Cursor)
+		}
+		if got.ETag != "" || got.Ecosystems != "" {
+			t.Errorf("non-empty fields on zero round trip: %+v", got)
+		}
+	})
+}
 
-	got, err := s.GetCursor(ctx, source)
+// TestSourceState_AbsentRow_ReturnsZeroValue pins that the store does
+// not leak sql.ErrNoRows; callers treat zero-value as "no state yet".
+func TestSourceState_AbsentRow_ReturnsZeroValue(t *testing.T) {
+	s, _ := newTestStore(t)
+	got, err := s.GetSourceState(context.Background(), "never-saved")
 	if err != nil {
-		t.Fatalf("GetCursor() error = %v", err)
+		t.Fatalf("GetSourceState: %v", err)
 	}
-
-	if !got.Equal(cursor) {
-		t.Errorf("GetCursor() = %v, want %v", got, cursor)
+	if got != (store.SourceState{}) {
+		t.Errorf("absent row should return zero value, got %+v", got)
 	}
 }
 
-func TestGetCursor_ErrorConditions(t *testing.T) {
+// TestSourceState_OverwritesBothFieldsAtomically pins that the second
+// Save replaces every column. If the API ever drifts back to a partial
+// update (the rev4 SaveETag pattern), this fails because the original
+// fields linger.
+func TestSourceState_OverwritesBothFieldsAtomically(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	t.Run("NonExistentSource_ReturnsNoRowsError", func(t *testing.T) {
-		_, err := s.GetCursor(ctx, "non-existent-source")
-		if err == nil {
-			t.Fatal("GetCursor() with non-existent source should return error")
-		}
+	first := store.SourceState{
+		Cursor:     time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC),
+		ETag:       `"first"`,
+		Ecosystems: "npm",
+	}
+	if err := s.SaveSourceState(ctx, "k", first); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
 
-		if err != sql.ErrNoRows {
-			t.Errorf("GetCursor() should return sql.ErrNoRows directly for non-existent source, got: %v (type: %T)", err, err)
-		}
-	})
+	second := store.SourceState{
+		Cursor:     time.Date(2025, 10, 5, 0, 0, 0, 0, time.UTC),
+		ETag:       `"second"`,
+		Ecosystems: "PyPI",
+	}
+	if err := s.SaveSourceState(ctx, "k", second); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
 
-	t.Run("DBError_DistinguishedFromNoRows", func(t *testing.T) {
-		originalStore := s
-		s.Close() //nolint:errcheck
+	got, err := s.GetSourceState(ctx, "k")
+	if err != nil {
+		t.Fatalf("GetSourceState: %v", err)
+	}
+	if !got.Cursor.Equal(second.Cursor) || got.ETag != second.ETag || got.Ecosystems != second.Ecosystems {
+		t.Fatalf("partial overwrite: got %+v, want %+v", got, second)
+	}
+}
 
-		_, err := originalStore.GetCursor(ctx, "any-source")
-		if err == nil {
-			t.Fatal("GetCursor() on closed DB should return error")
-		}
+// TestSourceState_StrictParse_RejectsCorruptCursor pins that
+// GetSourceState surfaces unparseable cursors as errors rather than
+// silently treating them as zero. External tampering is the only way
+// to produce such a row under the new API, and the runbook tells the
+// operator to DELETE it.
+func TestSourceState_StrictParse_RejectsCorruptCursor(t *testing.T) {
+	_, dbPath := newTestStore(t)
+	ctx := context.Background()
 
-		if err == sql.ErrNoRows {
-			t.Errorf("GetCursor() DB error should NOT be sql.ErrNoRows, got: %v", err)
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+	if _, err := db.ExecContext(ctx, "INSERT INTO source_cursor (source, cursor) VALUES (?, ?)", "tampered", "garbage"); err != nil {
+		t.Fatalf("inject row: %v", err)
+	}
+
+	s2, err := store.NewStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	if _, err := s2.GetSourceState(ctx, "tampered"); err == nil {
+		t.Fatal("GetSourceState should reject corrupt cursor, got nil error")
+	}
+}
+
+// TestSaveVulnerabilityWithAffected_FetchedAtNotRestampedOnSameModified
+// pins the D4 fetched_at semantics: an unchanged record on re-ingest
+// keeps its original fetched_at, so a retry after a partial-failure run
+// does not flood the diff report. A subsequent save with a new modified
+// stamps a fresh fetched_at.
+func TestSaveVulnerabilityWithAffected_FetchedAtNotRestampedOnSameModified(t *testing.T) {
+	s, dbPath := newTestStore(t)
+	ctx := context.Background()
+
+	clock := newTickingClock(time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC), time.Hour)
+	store.SetStoreClockForTesting(s, clock.Now)
+
+	v := store.Vulnerability{ID: "V-stable", Modified: time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, nil); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	var firstFetched int64
+	if err := db.QueryRowContext(ctx, "SELECT fetched_at FROM vulnerability WHERE id = ?", v.ID).Scan(&firstFetched); err != nil {
+		t.Fatalf("read first fetched_at: %v", err)
+	}
+
+	// Same modified, the clock has already ticked: fetched_at must stay put.
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, nil); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	var secondFetched int64
+	if err := db.QueryRowContext(ctx, "SELECT fetched_at FROM vulnerability WHERE id = ?", v.ID).Scan(&secondFetched); err != nil {
+		t.Fatalf("read second fetched_at: %v", err)
+	}
+	if secondFetched != firstFetched {
+		t.Errorf("fetched_at restamped on unchanged modified: first=%d, second=%d", firstFetched, secondFetched)
+	}
+
+	// Bump modified: fetched_at must advance.
+	v.Modified = v.Modified.Add(24 * time.Hour)
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, nil); err != nil {
+		t.Fatalf("third save: %v", err)
+	}
+	var thirdFetched int64
+	if err := db.QueryRowContext(ctx, "SELECT fetched_at FROM vulnerability WHERE id = ?", v.ID).Scan(&thirdFetched); err != nil {
+		t.Fatalf("read third fetched_at: %v", err)
+	}
+	if thirdFetched == firstFetched {
+		t.Errorf("fetched_at did not advance after modified change: %d", thirdFetched)
+	}
+}
+
+// seedV8Database materialises a v8-shape SQLite file (last migration
+// before this rev's v9) and pre-populates source_cursor with three
+// rows representing each pre-rev5 state we want v9 to delete or keep.
+// The schema_version table is filled up to 8 so NewStore only re-runs
+// v9 and v10.
+func seedV8Database(t *testing.T, dbPath string) {
+	t.Helper()
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open v8 db: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	stmts := []string{
+		// v8 source_cursor shape: cursor TEXT NOT NULL + etag TEXT.
+		`CREATE TABLE source_cursor (source TEXT PRIMARY KEY, cursor TEXT NOT NULL, etag TEXT)`,
+		`CREATE TABLE vulnerability (
+			id TEXT PRIMARY KEY,
+			modified TEXT NOT NULL,
+			published TEXT,
+			summary TEXT,
+			details TEXT,
+			severity_base_score REAL,
+			severity_vector TEXT,
+			severity_type TEXT,
+			fetched_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE affected (
+			vuln_id TEXT NOT NULL,
+			ecosystem TEXT NOT NULL,
+			package TEXT NOT NULL,
+			PRIMARY KEY (vuln_id, ecosystem, package),
+			FOREIGN KEY (vuln_id) REFERENCES vulnerability(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE report_watermark (
+			ecosystem TEXT PRIMARY KEY,
+			reported_until INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_affected_ecosystem ON affected(ecosystem)`,
+		`CREATE INDEX idx_vulnerability_modified ON vulnerability(modified)`,
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (1), (2), (3), (4), (5), (6), (7), (8)`,
+		// Healthy-looking unified row.
+		`INSERT INTO source_cursor (source, cursor, etag) VALUES ('__unified__', '2025-10-01T00:00:00Z', '"healthy"')`,
+		// rev4 cursor='' poison row.
+		`INSERT INTO source_cursor (source, cursor, etag) VALUES ('__unified__-poison', '', '"orphan-etag"')`,
+		// pre-F per-ecosystem row.
+		`INSERT INTO source_cursor (source, cursor, etag) VALUES ('npm', '2025-09-01T00:00:00Z', NULL)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("seed v8 exec %q: %v", q, err)
 		}
-	})
+	}
+}
+
+// TestMigrationV9_TruncatesSourceCursor pins that opening a v8-shape
+// database under the new code deletes every source_cursor row — even
+// rows that look healthy — and leaves the ecosystems column ready for
+// SaveSourceState.
+func TestMigrationV9_TruncatesSourceCursor(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v8.db")
+	seedV8Database(t, dbPath)
+
+	s, err := store.NewStore(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("NewStore on v8 DB: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	var count int
+	if err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM source_cursor").Scan(&count); err != nil {
+		t.Fatalf("count source_cursor: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("v9 should have truncated source_cursor, got %d rows", count)
+	}
+
+	got, err := s.GetSourceState(context.Background(), "__unified__")
+	if err != nil {
+		t.Fatalf("GetSourceState after v9: %v", err)
+	}
+	if got != (store.SourceState{}) {
+		t.Errorf("post-v9 state should be zero, got %+v", got)
+	}
+
+	// v10 must have added the ecosystems column so SaveSourceState works.
+	if err := s.SaveSourceState(context.Background(), "__unified__", store.SourceState{
+		Cursor:     time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC),
+		ETag:       `"new"`,
+		Ecosystems: "npm",
+	}); err != nil {
+		t.Fatalf("SaveSourceState after v9/v10: %v", err)
+	}
 }
 
 func TestSaveVulnerabilityWithAffected_NewEntry_PersistsIdempotently(t *testing.T) {
@@ -703,22 +929,21 @@ func TestDiff_NoChange_EmitsZero(t *testing.T) {
 	}
 }
 
-func TestWatermark_FetchedAtSkewProtection(t *testing.T) {
+// TestWatermark_UnchangedRecordStaysQuietOnReingest pins the D4
+// fetched_at-CASE semantics at the diff layer: re-ingesting the same
+// record on retry does not resurface it. fetched_at is the "new content
+// arrived" axis, not "we touched the row" — see the D4 acceptance note
+// in the rev5 plan for the full causal analysis.
+func TestWatermark_UnchangedRecordStaysQuietOnReingest(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	// Scenario: a record is reported (advancing watermark to fetched_at=T1)
-	// and then the SAME record is re-fetched later (fetched_at=T2 > T1) with
-	// a modified timestamp that is BEFORE the watermark in modified-space.
-	// Under a fetched_at-axis watermark the second fetch must surface again.
 	t0 := time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
 	clock := newTickingClock(t0, time.Hour)
 	store.SetStoreClockForTesting(s, clock.Now)
 
-	modifiedEarly := time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC) // before everything
-
-	v := store.Vulnerability{ID: "V-skew", Modified: modifiedEarly}
-	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-skew", Ecosystem: "npm", Package: "p"}}); err != nil {
+	v := store.Vulnerability{ID: "V-stable", Modified: time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-stable", Ecosystem: "npm", Package: "p"}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 	first, err := s.GetUnreportedVulnerabilities(ctx, "npm")
@@ -729,17 +954,59 @@ func TestWatermark_FetchedAtSkewProtection(t *testing.T) {
 		t.Fatalf("advance: %v", err)
 	}
 
-	// Second save: same modified (still before watermark in modified-space),
-	// new fetched_at via the ticking clock.
-	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-skew", Ecosystem: "npm", Package: "p"}}); err != nil {
+	// Same modified, clock has ticked: D4's CASE keeps fetched_at fixed.
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-stable", Ecosystem: "npm", Package: "p"}}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 	second, err := s.GetUnreportedVulnerabilities(ctx, "npm")
 	if err != nil {
 		t.Fatalf("second diff err: %v", err)
 	}
-	if len(second) != 1 {
-		t.Errorf("re-fetched record should resurface on fetched_at axis: got %d rows, want 1", len(second))
+	if len(second) != 0 {
+		t.Errorf("unchanged record resurfaced in diff: got %d rows, want 0", len(second))
+	}
+}
+
+// TestWatermark_DelayedInitialIngestSurfaces pins that a record whose
+// FIRST ingest happens after another record has already advanced the
+// watermark still surfaces in the diff. INSERT stamps fetched_at = now
+// unconditionally (the CASE only fires on UPDATE), so the
+// "initial-delay" guarantee still holds even though re-ingest is now
+// quiet.
+func TestWatermark_DelayedInitialIngestSurfaces(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	t0 := time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
+	clock := newTickingClock(t0, time.Hour)
+	store.SetStoreClockForTesting(s, clock.Now)
+
+	// First record advances the watermark at fetched_at=t0.
+	early := store.Vulnerability{ID: "V-first", Modified: time.Date(2025, 9, 15, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, early, []store.Affected{{VulnID: "V-first", Ecosystem: "npm", Package: "p"}}); err != nil {
+		t.Fatalf("save early: %v", err)
+	}
+	rows, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil {
+		t.Fatalf("first diff: %v", err)
+	}
+	if err := s.AdvanceWatermarks(ctx, rows); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	// Second record has an OLDER modified but arrives now (fetched_at>watermark).
+	// It is the first ingest of this ID so the INSERT path runs and stamps
+	// fetched_at unconditionally — the diff must surface it.
+	late := store.Vulnerability{ID: "V-late", Modified: time.Date(2025, 8, 1, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, late, []store.Affected{{VulnID: "V-late", Ecosystem: "npm", Package: "q"}}); err != nil {
+		t.Fatalf("save late: %v", err)
+	}
+	second, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil {
+		t.Fatalf("second diff: %v", err)
+	}
+	if len(second) != 1 || second[0].ID != "V-late" {
+		t.Errorf("delayed initial ingest did not surface: got %+v, want only V-late", second)
 	}
 }
 

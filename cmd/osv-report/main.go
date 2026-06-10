@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/pHo9UBenaA/osv-report/internal/app"
 	"github.com/pHo9UBenaA/osv-report/internal/config"
@@ -45,7 +47,8 @@ func main() {
 }
 
 func runFetch() error {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -62,7 +65,7 @@ func runFetch() error {
 		}
 	}()
 
-	source := osv.NewUnifiedAllZipSource(st)
+	source := osv.NewUnifiedAllZipSource()
 	lister := osv.NewEcosystemsFetcher(config.EcosystemsListURL, nil)
 	return app.Fetch(ctx, cfg, source, st, lister)
 }
@@ -79,7 +82,8 @@ func runReport() error {
 	// it exits the process on parse failure.
 	reportCmd.Parse(os.Args[2:]) //nolint:errcheck
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	cfg, err := config.Load()
 	if err != nil {
