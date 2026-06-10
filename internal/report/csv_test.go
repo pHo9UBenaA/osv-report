@@ -1,6 +1,7 @@
 package report_test
 
 import (
+	"bytes"
 	"encoding/csv"
 	"strings"
 	"testing"
@@ -8,7 +9,22 @@ import (
 	"github.com/pHo9UBenaA/osv-report/internal/report"
 )
 
-func TestFormatCSV_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
+func formatCSV(t *testing.T, entries []report.VulnerabilityEntry) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := (&report.CSVFormatter{}).Format(&buf, entries); err != nil {
+		t.Fatalf("CSVFormatter.Format() error = %v", err)
+	}
+	return buf.String()
+}
+
+func TestCSVFormatter_Extension_ReturnsDotCSV(t *testing.T) {
+	if got := (&report.CSVFormatter{}).Extension(); got != ".csv" {
+		t.Errorf("Extension() = %q, want %q", got, ".csv")
+	}
+}
+
+func TestCSVFormatter_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
 			ID:        "GHSA-xxxx-yyyy-zzzz",
@@ -32,10 +48,7 @@ func TestFormatCSV_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
 		},
 	}
 
-	result, err := report.FormatCSV(entries)
-	if err != nil {
-		t.Fatalf("FormatCSV() error = %v", err)
-	}
+	result := formatCSV(t, entries)
 
 	if !strings.Contains(result, "ecosystem,package,id,published,modified,severity_base_score,severity_type,severity_vector") {
 		t.Errorf("missing header in result")
@@ -50,7 +63,7 @@ func TestFormatCSV_MixedEntries_ProducesHeaderAndDataRows(t *testing.T) {
 	}
 }
 
-func TestFormatCSV_FormulaInjectionPrefixes_EscapedWithQuote(t *testing.T) {
+func TestCSVFormatter_FormulaInjectionPrefixes_EscapedWithQuote(t *testing.T) {
 	tests := []struct {
 		name        string
 		entry       report.VulnerabilityEntry
@@ -92,10 +105,7 @@ func TestFormatCSV_FormulaInjectionPrefixes_EscapedWithQuote(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := report.FormatCSV([]report.VulnerabilityEntry{tt.entry})
-			if err != nil {
-				t.Fatalf("FormatCSV() error = %v", err)
-			}
+			result := formatCSV(t, []report.VulnerabilityEntry{tt.entry})
 
 			r := csv.NewReader(strings.NewReader(result))
 			records, err := r.ReadAll()
@@ -114,7 +124,7 @@ func TestFormatCSV_FormulaInjectionPrefixes_EscapedWithQuote(t *testing.T) {
 	}
 }
 
-func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T) {
+func TestCSVFormatter_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T) {
 	entry := report.VulnerabilityEntry{
 		ID:             "\n=INJECT",
 		Ecosystem:      " npm",
@@ -122,10 +132,7 @@ func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T)
 		SeverityVector: "\r@ALERT",
 	}
 
-	result, err := report.FormatCSV([]report.VulnerabilityEntry{entry})
-	if err != nil {
-		t.Fatalf("FormatCSV() error = %v", err)
-	}
+	result := formatCSV(t, []report.VulnerabilityEntry{entry})
 
 	r := csv.NewReader(strings.NewReader(result))
 	records, err := r.ReadAll()
@@ -138,8 +145,6 @@ func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T)
 	}
 
 	data := records[1]
-	// field 0=ecosystem, 1=package, 2=id, 6=severity_type, 7=severity_vector
-	// Each dangerous-prefix field should be escaped with a leading single quote.
 	if data[2] != "'\n=INJECT" {
 		t.Errorf("id field = %q, want %q", data[2], "'\n=INJECT")
 	}
@@ -148,5 +153,44 @@ func TestFormatCSV_LeadingWhitespaceThenDangerousChar_StillEscaped(t *testing.T)
 	}
 	if data[7] != "'\r@ALERT" {
 		t.Errorf("severity_vector field = %q, want %q", data[7], "'\r@ALERT")
+	}
+}
+
+// TestEscapeCSVInjection_TabAndCR_GetsEscaped covers the stage-1 raw
+// first-rune check. If TrimLeftFunc(unicode.IsSpace) runs before the
+// dangerous-char inspection it eats '\t', '\r', '\n' and the field
+// slips through unescaped.
+func TestEscapeCSVInjection_TabAndCR_GetsEscaped(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		wantPkg string
+	}{
+		{"TabPrefix", "\tcmd", "'\tcmd"},
+		{"CRPrefix", "\rcmd", "'\rcmd"},
+		{"LFPrefix", "\ncmd", "'\ncmd"},
+		{"SpaceThenEquals", "  =cmd", "'  =cmd"},
+		{"Equals", "=cmd", "'=cmd"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := report.VulnerabilityEntry{
+				ID: "GHSA-x", Ecosystem: "npm", Package: tt.in, SeverityVector: "HIGH",
+			}
+			result := formatCSV(t, []report.VulnerabilityEntry{entry})
+
+			r := csv.NewReader(strings.NewReader(result))
+			records, err := r.ReadAll()
+			if err != nil {
+				t.Fatalf("csv.ReadAll() error = %v", err)
+			}
+			if len(records) < 2 {
+				t.Fatalf("expected at least 2 records, got %d", len(records))
+			}
+			if got := records[1][1]; got != tt.wantPkg {
+				t.Errorf("package field = %q, want %q", got, tt.wantPkg)
+			}
+		})
 	}
 }

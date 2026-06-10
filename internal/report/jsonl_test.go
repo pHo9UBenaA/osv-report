@@ -1,6 +1,7 @@
 package report_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,7 +9,22 @@ import (
 	"github.com/pHo9UBenaA/osv-report/internal/report"
 )
 
-func TestFormatJSONL_MixedEntries_ProducesOneLinePerEntry(t *testing.T) {
+func formatJSONL(t *testing.T, entries []report.VulnerabilityEntry) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := (&report.JSONLFormatter{}).Format(&buf, entries); err != nil {
+		t.Fatalf("JSONLFormatter.Format() error = %v", err)
+	}
+	return buf.String()
+}
+
+func TestJSONLFormatter_Extension_ReturnsDotJSONL(t *testing.T) {
+	if got := (&report.JSONLFormatter{}).Extension(); got != ".jsonl" {
+		t.Errorf("Extension() = %q, want %q", got, ".jsonl")
+	}
+}
+
+func TestJSONLFormatter_MixedEntries_ProducesOneLinePerEntry(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
 			ID:        "GHSA-xxxx-yyyy-zzzz",
@@ -31,10 +47,7 @@ func TestFormatJSONL_MixedEntries_ProducesOneLinePerEntry(t *testing.T) {
 		},
 	}
 
-	result, err := report.FormatJSONL(entries)
-	if err != nil {
-		t.Fatalf("FormatJSONL() error = %v", err)
-	}
+	result := formatJSONL(t, entries)
 
 	lines := strings.Split(strings.TrimSpace(result), "\n")
 	if len(lines) != 2 {
@@ -48,23 +61,30 @@ func TestFormatJSONL_MixedEntries_ProducesOneLinePerEntry(t *testing.T) {
 	if first["id"] != "GHSA-xxxx-yyyy-zzzz" {
 		t.Errorf("first.id = %v, want GHSA-xxxx-yyyy-zzzz", first["id"])
 	}
-	if first["severity_base_score"] != "9.8" {
-		t.Errorf("first.severity_base_score = %v, want 9.8", first["severity_base_score"])
+	// Native JSON number, not the legacy "9.8" string.
+	if got, ok := first["severity_base_score"].(float64); !ok || got != 9.8 {
+		t.Errorf("first.severity_base_score = %v (%T), want 9.8 (float64)", first["severity_base_score"], first["severity_base_score"])
 	}
 
 	var second map[string]any
 	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
 		t.Fatalf("failed to parse second line: %v", err)
 	}
-	if second["published"] != "NA" {
-		t.Errorf("second.published = %v, want NA", second["published"])
+	// Empty timestamps remain empty strings (no more "NA").
+	if second["published"] != "" {
+		t.Errorf("second.published = %v, want empty string", second["published"])
 	}
-	if second["severity_base_score"] != "NA" {
-		t.Errorf("second.severity_base_score = %v, want NA", second["severity_base_score"])
+	// Missing score is null, not "NA".
+	if second["severity_base_score"] != nil {
+		t.Errorf("second.severity_base_score = %v, want nil/null", second["severity_base_score"])
+	}
+	// Verify the literal JSON token is `null`, not a string.
+	if !strings.Contains(lines[1], `"severity_base_score":null`) {
+		t.Errorf("expected literal JSON null for severity_base_score, got line: %s", lines[1])
 	}
 }
 
-func TestFormatJSONL_DangerousCharsAndControlCodes_SafelyJSONEncoded(t *testing.T) {
+func TestJSONLFormatter_DangerousCharsAndControlCodes_SafelyJSONEncoded(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
 			ID:             "=cmd|'/c calc'!A1",
@@ -84,10 +104,7 @@ func TestFormatJSONL_DangerousCharsAndControlCodes_SafelyJSONEncoded(t *testing.
 		},
 	}
 
-	result, err := report.FormatJSONL(entries)
-	if err != nil {
-		t.Fatalf("FormatJSONL() error = %v", err)
-	}
+	result := formatJSONL(t, entries)
 	lines := strings.Split(strings.TrimSpace(result), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 lines, got %d", len(lines))

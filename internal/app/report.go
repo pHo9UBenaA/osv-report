@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -29,7 +30,18 @@ type ReportOptions struct {
 
 // GenerateReport creates a vulnerability report from the database.
 func GenerateReport(ctx context.Context, st ReportStore, opts ReportOptions) error {
-	outputPath := resolveOutputPath(opts.OutputDir, opts.FilePrefix, opts.Format, time.Now().UTC())
+	formatter, ok := report.FormatterByName(opts.Format)
+	if !ok {
+		return fmt.Errorf("unknown report format: %s (supported: markdown, csv, jsonl)", opts.Format)
+	}
+	// Markdown carries metadata (count, ecosystem filter, diff flag) in
+	// its header, so wire those through. Other formatters are stateless.
+	if md, ok := formatter.(*report.MarkdownFormatter); ok {
+		md.Ecosystem = opts.Ecosystem
+		md.Diff = opts.Diff
+	}
+
+	outputPath := resolveOutputPath(opts.OutputDir, opts.FilePrefix, formatter.Extension(), time.Now().UTC())
 	slog.Info("generating report", "format", opts.Format, "output", outputPath, "ecosystem", opts.Ecosystem, "diff", opts.Diff)
 
 	var rows []store.ReportRow
@@ -56,19 +68,18 @@ func GenerateReport(ctx context.Context, st ReportStore, opts ReportOptions) err
 
 	reportEntries := convertToReportEntries(rows)
 
-	switch opts.Format {
-	case "markdown":
-		err = report.WriteMarkdown(outputPath, reportEntries)
-	case "csv":
-		err = report.WriteCSV(outputPath, reportEntries)
-	case "jsonl":
-		err = report.WriteJSONL(outputPath, reportEntries)
-	default:
-		return fmt.Errorf("unknown report format: %s (supported: markdown, csv, jsonl)", opts.Format)
-	}
-
+	f, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return fmt.Errorf("write report: %w", err)
+		return fmt.Errorf("create report file: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			slog.Error("close report file", "error", cerr)
+		}
+	}()
+
+	if err := formatter.Format(f, reportEntries); err != nil {
+		return fmt.Errorf("format report: %w", err)
 	}
 
 	slog.Info("report generated successfully", "output", outputPath)
@@ -83,23 +94,11 @@ func GenerateReport(ctx context.Context, st ReportStore, opts ReportOptions) err
 	return nil
 }
 
-func resolveOutputPath(dir, prefix, format string, now time.Time) string {
-	ext := formatToExtension(format)
+// resolveOutputPath composes "<dir>/<prefix>_<UTC timestamp><ext>" so
+// every run produces a unique, sortable filename.
+func resolveOutputPath(dir, prefix, ext string, now time.Time) string {
 	filename := fmt.Sprintf("%s_%s%s", prefix, now.Format("20060102T150405Z"), ext)
 	return filepath.Join(dir, filename)
-}
-
-func formatToExtension(format string) string {
-	switch format {
-	case "markdown":
-		return ".md"
-	case "csv":
-		return ".csv"
-	case "jsonl":
-		return ".jsonl"
-	default:
-		return ".txt"
-	}
 }
 
 func convertToReportEntries(rows []store.ReportRow) []report.VulnerabilityEntry {

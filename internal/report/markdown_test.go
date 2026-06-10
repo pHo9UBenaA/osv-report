@@ -1,13 +1,24 @@
 package report_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pHo9UBenaA/osv-report/internal/report"
 )
 
-func TestFormatMarkdown_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
+func formatMarkdown(t *testing.T, f *report.MarkdownFormatter, entries []report.VulnerabilityEntry) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := f.Format(&buf, entries); err != nil {
+		t.Fatalf("MarkdownFormatter.Format() error = %v", err)
+	}
+	return buf.String()
+}
+
+func TestMarkdownFormatter_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
 			ID:        "GHSA-xxxx-yyyy-zzzz",
@@ -31,7 +42,24 @@ func TestFormatMarkdown_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 		},
 	}
 
-	result := report.FormatMarkdown(entries)
+	f := &report.MarkdownFormatter{Now: func() time.Time { return time.Date(2026, 6, 10, 18, 32, 0, 0, time.UTC) }}
+	result := formatMarkdown(t, f, entries)
+
+	if !strings.Contains(result, "# Vulnerability Report") {
+		t.Errorf("missing report header in result")
+	}
+	if !strings.Contains(result, "- Generated: 2026-06-10T18:32:00Z") {
+		t.Errorf("missing or wrong Generated timestamp in result")
+	}
+	if !strings.Contains(result, "- Count: 2") {
+		t.Errorf("missing or wrong Count in result")
+	}
+	if !strings.Contains(result, "- Ecosystem filter: all") {
+		t.Errorf("missing Ecosystem filter line (should default to 'all')")
+	}
+	if !strings.Contains(result, "- Diff: false") {
+		t.Errorf("missing Diff line")
+	}
 
 	if !strings.Contains(result, "| Ecosystem | Package | ID | Published | Modified | Severity: Base Score | Severity: Type | Severity: Vector String |") {
 		t.Errorf("missing header in result")
@@ -50,7 +78,33 @@ func TestFormatMarkdown_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 	}
 }
 
-func TestFormatMarkdown_SpecialChars_EscapesPipeAndHTML(t *testing.T) {
+func TestMarkdownFormatter_Header_RecordsEcosystemAndDiff(t *testing.T) {
+	f := &report.MarkdownFormatter{
+		Ecosystem: "npm",
+		Diff:      true,
+		Now:       func() time.Time { return time.Date(2026, 6, 10, 18, 32, 0, 0, time.UTC) },
+	}
+	result := formatMarkdown(t, f, []report.VulnerabilityEntry{{ID: "x", Ecosystem: "npm", Package: "p"}})
+
+	if !strings.Contains(result, "- Ecosystem filter: npm") {
+		t.Errorf("expected ecosystem filter 'npm' in header, got: %s", result)
+	}
+	if !strings.Contains(result, "- Diff: true") {
+		t.Errorf("expected Diff: true in header, got: %s", result)
+	}
+	if !strings.Contains(result, "- Count: 1") {
+		t.Errorf("expected Count: 1 in header, got: %s", result)
+	}
+}
+
+func TestMarkdownFormatter_Extension_ReturnsDotMd(t *testing.T) {
+	f := &report.MarkdownFormatter{}
+	if got := f.Extension(); got != ".md" {
+		t.Errorf("Extension() = %q, want %q", got, ".md")
+	}
+}
+
+func TestMarkdownFormatter_SpecialChars_EscapesPipeAndHTML(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
 			ID:             "GHSA-test-0001",
@@ -74,7 +128,7 @@ func TestFormatMarkdown_SpecialChars_EscapesPipeAndHTML(t *testing.T) {
 		},
 	}
 
-	result := report.FormatMarkdown(entries)
+	result := formatMarkdown(t, &report.MarkdownFormatter{}, entries)
 
 	if strings.Contains(result, "pkg-with-|pipe|chars") {
 		t.Errorf("pipe characters in package name should be escaped, got: %s", result)
@@ -93,5 +147,43 @@ func TestFormatMarkdown_SpecialChars_EscapesPipeAndHTML(t *testing.T) {
 
 	if strings.Contains(result, "*emphasis*") && !strings.Contains(result, "\\*emphasis\\*") {
 		t.Errorf("markdown emphasis characters should be escaped, got: %s", result)
+	}
+}
+
+func TestMarkdownFormatter_NewlineHandling_CRLFCollapsesToSingleBr(t *testing.T) {
+	// CRLF must produce one <br>, not two. If "\n" → "<br>" ran first,
+	// "\r\n" would emit "<br>\r" then "<br>", giving "<br><br>" (or
+	// worse, leaving a stray \r). Tests the replacer ordering.
+	entries := []report.VulnerabilityEntry{
+		{
+			ID:        "crlf",
+			Ecosystem: "npm",
+			Package:   "line1\r\nline2",
+			Published: "lone\rcr",
+			Modified:  "lone\nlf",
+		},
+	}
+
+	result := formatMarkdown(t, &report.MarkdownFormatter{}, entries)
+
+	if strings.Contains(result, "<br><br>") {
+		t.Errorf("CRLF should collapse to a single <br>, got double <br><br> in: %s", result)
+	}
+	if strings.Contains(result, "\r") || strings.Contains(result, "\n| ") {
+		// Note: real row terminators still use \n; we only object to
+		// raw \r anywhere, and to \n appearing *inside* a cell (which
+		// would manifest as "\n| " mid-row).
+		if strings.Contains(result, "\r") {
+			t.Errorf("raw \\r should be replaced, got: %q", result)
+		}
+	}
+	if !strings.Contains(result, "line1<br>line2") {
+		t.Errorf("expected 'line1<br>line2' in result, got: %s", result)
+	}
+	if !strings.Contains(result, "lone<br>cr") {
+		t.Errorf("expected lone CR replaced with <br>, got: %s", result)
+	}
+	if !strings.Contains(result, "lone<br>lf") {
+		t.Errorf("expected lone LF replaced with <br>, got: %s", result)
 	}
 }
