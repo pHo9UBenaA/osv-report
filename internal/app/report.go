@@ -15,7 +15,7 @@ import (
 type ReportStore interface {
 	GetVulnerabilitiesForReport(ctx context.Context, ecosystem string) ([]store.ReportRow, error)
 	GetUnreportedVulnerabilities(ctx context.Context, ecosystem string) ([]store.ReportRow, error)
-	SaveReportSnapshot(ctx context.Context, entries []store.ReportRow) error
+	AdvanceWatermarks(ctx context.Context, rows []store.ReportRow) error
 }
 
 // ReportOptions holds options for report generation.
@@ -74,14 +74,10 @@ func GenerateReport(ctx context.Context, st ReportStore, opts ReportOptions) err
 	slog.Info("report generated successfully", "output", outputPath)
 
 	if opts.Diff {
-		allRows, err := st.GetVulnerabilitiesForReport(ctx, opts.Ecosystem)
-		if err != nil {
-			return fmt.Errorf("get all vulnerabilities for snapshot: %w", err)
+		if err := st.AdvanceWatermarks(ctx, rows); err != nil {
+			return fmt.Errorf("advance watermarks: %w", err)
 		}
-		if err := st.SaveReportSnapshot(ctx, allRows); err != nil {
-			return fmt.Errorf("save report snapshot: %w", err)
-		}
-		slog.Info("saved report snapshot", "count", len(allRows))
+		slog.Info("advanced watermarks", "rows", len(rows))
 	}
 
 	return nil

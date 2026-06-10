@@ -51,19 +51,26 @@ type Affected struct {
 
 // ReportRow represents a vulnerability with metadata for reporting.
 // Uses *float64 instead of sql.NullFloat64 to keep DB details internal.
+//
+// FetchedAt is the ingest timestamp in Unix nanoseconds (the column type
+// SQLite sees is INTEGER). The watermark machinery operates on this value;
+// using int64 instead of a formatted string keeps comparison numeric and
+// avoids the trailing-zero footgun in time.RFC3339Nano.
 type ReportRow struct {
 	ID             string
 	Ecosystem      string
 	Package        string
 	Published      string
 	Modified       string
+	FetchedAt      int64
 	SeverityScore  *float64
 	SeverityVector string
 }
 
 // Store manages database operations for the OSV scraper.
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	clock func() time.Time
 }
 
 func toNullableFloat(value *float64) any {
@@ -113,7 +120,7 @@ func NewStore(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	s := &Store{db: db}
+	s := &Store{db: db, clock: time.Now}
 
 	if err := s.initSchema(ctx); err != nil {
 		db.Close() //nolint:errcheck
@@ -232,6 +239,30 @@ func (s *Store) runMigrations(ctx context.Context) error {
 			disablesFKDuringRebuild: true,
 		},
 		{version: 3, sql: "UPDATE vulnerability SET published = NULL WHERE published = ''"},
+		{
+			version: 4,
+			sql: `
+				ALTER TABLE vulnerability ADD COLUMN fetched_at INTEGER NOT NULL DEFAULT 0;
+				UPDATE vulnerability
+					SET fetched_at = CAST(strftime('%s', modified) AS INTEGER) * 1000000000
+					WHERE fetched_at = 0;
+			`,
+		},
+		{
+			version: 5,
+			sql: `
+				CREATE TABLE report_watermark (
+					ecosystem TEXT PRIMARY KEY,
+					reported_until INTEGER NOT NULL
+				);
+				INSERT INTO report_watermark (ecosystem, reported_until)
+					SELECT ecosystem,
+					       MAX(CAST(strftime('%s', modified) AS INTEGER) * 1000000000)
+					FROM reported_snapshot
+					GROUP BY ecosystem;
+				DROP TABLE reported_snapshot;
+			`,
+		},
 	}
 
 	for _, m := range migrations {
@@ -327,23 +358,30 @@ func (s *Store) GetCursor(ctx context.Context, source string) (time.Time, error)
 // "append affected rows" API leaks stale entries when an upstream record
 // shrinks its affected list. The DELETE inside the tx makes the persisted
 // set match the input set exactly.
+//
+// fetched_at is stamped here from s.clock, not from the caller, so the
+// watermark axis is decoupled from the OSV-supplied modified timestamp.
+// That decoupling prevents records whose modified is older than the
+// previous watermark from being silently skipped on re-fetch.
 func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerability, affected []Affected) error {
 	publishedParam := any(nil)
 	if !v.Published.IsZero() {
 		publishedParam = v.Published.UTC().Format(timeFormat)
 	}
+	fetchedAt := s.clock().UTC().UnixNano()
 
 	return withTx(ctx, s.db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO vulnerability (id, modified, published, summary, details, severity_base_score, severity_vector, fetched_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				modified = excluded.modified,
 				published = excluded.published,
 				summary = excluded.summary,
 				details = excluded.details,
 				severity_base_score = excluded.severity_base_score,
-				severity_vector = excluded.severity_vector
+				severity_vector = excluded.severity_vector,
+				fetched_at = excluded.fetched_at
 		`,
 			v.ID,
 			v.Modified.UTC().Format(timeFormat),
@@ -352,6 +390,7 @@ func (s *Store) SaveVulnerabilityWithAffected(ctx context.Context, v Vulnerabili
 			v.Details,
 			toNullableFloat(v.SeverityBaseScore),
 			toNullString(v.SeverityVector),
+			fetchedAt,
 		); err != nil {
 			return fmt.Errorf("upsert vulnerability: %w", err)
 		}
@@ -396,13 +435,18 @@ func (s *Store) SaveTombstone(ctx context.Context, id string) error {
 	return nil
 }
 
-// scanReportRows scans report rows from sql.Rows, converting sql.NullFloat64 to *float64.
+// scanReportRows scans report rows from sql.Rows. Column order must match
+// the SELECT lists in reportSelectColumns.
 func scanReportRows(rows *sql.Rows) ([]ReportRow, error) {
 	var entries []ReportRow
 	for rows.Next() {
 		var r ReportRow
 		var score sql.NullFloat64
-		if err := rows.Scan(&r.ID, &r.Ecosystem, &r.Package, &r.Published, &r.Modified, &score, &r.SeverityVector); err != nil {
+		if err := rows.Scan(
+			&r.ID, &r.Ecosystem, &r.Package,
+			&r.Published, &r.Modified, &r.FetchedAt,
+			&score, &r.SeverityVector,
+		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		if score.Valid {
@@ -418,31 +462,40 @@ func scanReportRows(rows *sql.Rows) ([]ReportRow, error) {
 	return entries, nil
 }
 
+// reportSelectColumns is the SELECT projection shared by every query that
+// produces a ReportRow. Defined once so the SELECT-order vs Scan-order
+// contract has a single source of truth.
+const reportSelectColumns = `
+	v.id, a.ecosystem, a.package,
+	COALESCE(v.published, '') as published,
+	v.modified, v.fetched_at,
+	v.severity_base_score,
+	COALESCE(v.severity_vector, '') as severity_vector`
+
+// ecosystemClause returns the WHERE fragment and argument list used to
+// restrict a vulnerability/affected join to a single ecosystem. Empty
+// ecosystem produces no restriction.
+func ecosystemClause(ecosystem, prefix string) (string, []any) {
+	if ecosystem == "" {
+		return "", nil
+	}
+	return prefix + " a.ecosystem = ?", []any{ecosystem}
+}
+
 // GetVulnerabilitiesForReport retrieves vulnerabilities for reporting.
 func (s *Store) GetVulnerabilitiesForReport(ctx context.Context, ecosystem string) ([]ReportRow, error) {
+	clause, args := ecosystemClause(ecosystem, " WHERE")
 	query := `
-		SELECT v.id, a.ecosystem, a.package,
-			COALESCE(v.published, '') as published,
-			v.modified, v.severity_base_score,
-			COALESCE(v.severity_vector, '') as severity_vector
+		SELECT ` + reportSelectColumns + `
 		FROM vulnerability v
-		INNER JOIN affected a ON v.id = a.vuln_id`
+		INNER JOIN affected a ON v.id = a.vuln_id` + clause + `
+		ORDER BY COALESCE(v.published, v.modified) DESC`
 
-	var rows *sql.Rows
-	var err error
-
-	if ecosystem == "" {
-		query += " ORDER BY COALESCE(v.published, v.modified) DESC"
-		rows, err = s.db.QueryContext(ctx, query)
-	} else {
-		query += " WHERE a.ecosystem = ? ORDER BY COALESCE(v.published, v.modified) DESC"
-		rows, err = s.db.QueryContext(ctx, query, ecosystem)
-	}
-
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query vulnerabilities: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	return scanReportRows(rows)
 }
@@ -480,76 +533,65 @@ func (s *Store) DeleteVulnerabilitiesOlderThan(ctx context.Context, cutoff time.
 	return nil
 }
 
-// GetUnreportedVulnerabilities retrieves vulnerabilities that differ from the last snapshot.
+// GetUnreportedVulnerabilities returns the affected-package rows whose
+// fetched_at is past the report_watermark entry for their ecosystem.
+// Rows with no watermark entry (a freshly-tracked ecosystem) are all
+// returned. The watermark is per-ecosystem so an ecosystem-filtered diff
+// run never disturbs the watermark of any other ecosystem.
 func (s *Store) GetUnreportedVulnerabilities(ctx context.Context, ecosystem string) ([]ReportRow, error) {
+	clause, args := ecosystemClause(ecosystem, " AND")
 	query := `
-		SELECT v.id, a.ecosystem, a.package,
-			COALESCE(v.published, '') as published,
-			v.modified, v.severity_base_score,
-			COALESCE(v.severity_vector, '') as severity_vector
+		SELECT ` + reportSelectColumns + `
 		FROM vulnerability v
 		INNER JOIN affected a ON v.id = a.vuln_id
-		LEFT JOIN reported_snapshot r ON v.id = r.id AND a.ecosystem = r.ecosystem AND a.package = r.package
-		WHERE (r.id IS NULL
-			OR r.modified != v.modified
-			OR COALESCE(r.severity_base_score, -1) != COALESCE(v.severity_base_score, -1)
-			OR COALESCE(r.severity_vector, '') != COALESCE(v.severity_vector, ''))`
+		LEFT JOIN report_watermark w ON w.ecosystem = a.ecosystem
+		WHERE v.fetched_at > COALESCE(w.reported_until, 0)` + clause + `
+		ORDER BY COALESCE(v.published, v.modified) DESC`
 
-	var rows *sql.Rows
-	var err error
-
-	if ecosystem == "" {
-		query += " ORDER BY COALESCE(v.published, v.modified) DESC"
-		rows, err = s.db.QueryContext(ctx, query)
-	} else {
-		query += " AND a.ecosystem = ? ORDER BY COALESCE(v.published, v.modified) DESC"
-		rows, err = s.db.QueryContext(ctx, query, ecosystem)
-	}
-
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query unreported vulnerabilities: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	return scanReportRows(rows)
 }
 
-// SaveReportSnapshot saves the current report snapshot, replacing any existing snapshot.
-func (s *Store) SaveReportSnapshot(ctx context.Context, entries []ReportRow) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+// AdvanceWatermarks records that the given rows have been reported.
+// For each ecosystem touched it stores max(fetched_at) and refuses to
+// move backwards, so a stale or filtered re-run cannot regress the
+// watermark and re-flag rows that are already reported.
+func (s *Store) AdvanceWatermarks(ctx context.Context, rows []ReportRow) error {
+	if len(rows) == 0 {
+		return nil
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	// Clear existing snapshot
-	_, err = tx.ExecContext(ctx, "DELETE FROM reported_snapshot")
-	if err != nil {
-		return fmt.Errorf("clear snapshot: %w", err)
-	}
-
-	// Insert new snapshot entries
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO reported_snapshot (id, ecosystem, package, published, modified, severity_base_score, severity_vector)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare insert: %w", err)
-	}
-	defer stmt.Close() //nolint:errcheck
-
-	for _, e := range entries {
-		_, err = stmt.ExecContext(ctx, e.ID, e.Ecosystem, e.Package, e.Published, e.Modified, e.SeverityScore, toNullString(e.SeverityVector))
-		if err != nil {
-			return fmt.Errorf("insert snapshot entry: %w", err)
+	maxByEcosystem := make(map[string]int64)
+	for _, r := range rows {
+		if r.FetchedAt > maxByEcosystem[r.Ecosystem] {
+			maxByEcosystem[r.Ecosystem] = r.FetchedAt
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
+	return withTx(ctx, s.db, func(tx *sql.Tx) error {
+		stmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO report_watermark (ecosystem, reported_until)
+			VALUES (?, ?)
+			ON CONFLICT(ecosystem) DO UPDATE
+				SET reported_until = excluded.reported_until
+				WHERE excluded.reported_until > report_watermark.reported_until
+		`)
+		if err != nil {
+			return fmt.Errorf("prepare upsert watermark: %w", err)
+		}
+		defer stmt.Close() //nolint:errcheck
 
-	return nil
+		for eco, fa := range maxByEcosystem {
+			if _, err := stmt.ExecContext(ctx, eco, fa); err != nil {
+				return fmt.Errorf("upsert watermark for %s: %w", eco, err)
+			}
+		}
+		return nil
+	})
 }
 
 // Close closes the database connection.

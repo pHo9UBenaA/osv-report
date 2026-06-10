@@ -13,6 +13,83 @@ import (
 
 func ptrFloat64(v float64) *float64 { return &v }
 
+// tickingClock yields a deterministic time sequence: each call to Now()
+// returns the next tick. Used to make fetched_at predictable in tests.
+type tickingClock struct {
+	next time.Time
+	step time.Duration
+}
+
+func newTickingClock(start time.Time, step time.Duration) *tickingClock {
+	return &tickingClock{next: start, step: step}
+}
+
+func (c *tickingClock) Now() time.Time {
+	t := c.next
+	c.next = c.next.Add(c.step)
+	return t
+}
+
+// seedLegacyDatabase materializes a SQLite file at the v3 schema (post-
+// affected-CASCADE, post-published-NULL, but pre-fetched_at and pre-
+// watermark) with one vulnerability + one affected + a matching snapshot
+// row, then closes the connection. Calling NewStore against the resulting
+// path triggers migrations v4 and v5 against real legacy data.
+func seedLegacyDatabase(t *testing.T, dbPath string) {
+	t.Helper()
+	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	stmts := []string{
+		`CREATE TABLE source_cursor (source TEXT PRIMARY KEY, cursor TEXT NOT NULL)`,
+		`CREATE TABLE vulnerability (
+			id TEXT PRIMARY KEY,
+			modified TEXT NOT NULL,
+			published TEXT,
+			summary TEXT,
+			details TEXT,
+			severity_base_score REAL,
+			severity_vector TEXT
+		)`,
+		`CREATE TABLE tombstone (
+			id TEXT PRIMARY KEY,
+			deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE affected (
+			vuln_id TEXT NOT NULL,
+			ecosystem TEXT NOT NULL,
+			package TEXT NOT NULL,
+			PRIMARY KEY (vuln_id, ecosystem, package),
+			FOREIGN KEY (vuln_id) REFERENCES vulnerability(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE reported_snapshot (
+			id TEXT NOT NULL,
+			ecosystem TEXT NOT NULL,
+			package TEXT NOT NULL,
+			published TEXT,
+			modified TEXT,
+			severity_base_score REAL,
+			severity_vector TEXT,
+			PRIMARY KEY (id, ecosystem, package)
+		)`,
+		`CREATE INDEX idx_affected_ecosystem ON affected(ecosystem)`,
+		`CREATE INDEX idx_vulnerability_modified ON vulnerability(modified)`,
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (1), (2), (3)`,
+		`INSERT INTO vulnerability (id, modified) VALUES ('GHSA-legacy', '2025-10-01T00:00:00Z')`,
+		`INSERT INTO affected (vuln_id, ecosystem, package) VALUES ('GHSA-legacy', 'npm', 'legacy-pkg')`,
+		`INSERT INTO reported_snapshot (id, ecosystem, package, published, modified) VALUES ('GHSA-legacy', 'npm', 'legacy-pkg', NULL, '2025-10-01T00:00:00Z')`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("seed legacy db exec %q: %v", q, err)
+		}
+	}
+}
+
 // newTestStore creates a temp-dir SQLite store and registers Close as cleanup.
 // Returned dbPath lets callers open a second handle for direct SQL inspection.
 func newTestStore(t *testing.T) (*store.Store, string) {
@@ -446,72 +523,34 @@ func TestGetVulnerabilitiesForReport_DifferentDates_SortsByPublishedDescending(t
 	}
 }
 
-func TestSaveReportSnapshot_ReplaceExisting_ContainsOnlyNewEntries(t *testing.T) {
+func TestAdvanceWatermarks_MonotonicGuard(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	ctx := context.Background()
 
-	entries := []store.ReportRow{
-		{
-			ID:             "GHSA-test-1",
-			Ecosystem:      "npm",
-			Package:        "pkg1",
-			Published:      "2025-10-01T00:00:00Z",
-			Modified:       "2025-10-02T00:00:00Z",
-			SeverityScore:  ptrFloat64(9.8),
-			SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-		},
-		{
-			ID:             "GHSA-test-2",
-			Ecosystem:      "PyPI",
-			Package:        "pkg2",
-			Published:      "2025-10-03T00:00:00Z",
-			Modified:       "2025-10-03T00:00:00Z",
-			SeverityVector: "",
-		},
-	}
+	// Two rows for npm with fetched_at 100 and 200; running AdvanceWatermarks
+	// in both orders must leave the watermark at 200 (the higher value).
+	rowsLow := []store.ReportRow{{ID: "A", Ecosystem: "npm", Package: "p", FetchedAt: 100}}
+	rowsHigh := []store.ReportRow{{ID: "B", Ecosystem: "npm", Package: "p", FetchedAt: 200}}
 
-	if err := s.SaveReportSnapshot(ctx, entries); err != nil {
-		t.Fatalf("SaveReportSnapshot() error = %v", err)
+	if err := s.AdvanceWatermarks(ctx, rowsHigh); err != nil {
+		t.Fatalf("advance high: %v", err)
+	}
+	if err := s.AdvanceWatermarks(ctx, rowsLow); err != nil {
+		t.Fatalf("advance low: %v", err)
 	}
 
 	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
-		t.Fatalf("sql.Open() error = %v", err)
+		t.Fatalf("open: %v", err)
 	}
 	defer db.Close() //nolint:errcheck
 
-	var count int
-	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM reported_snapshot").Scan(&count)
-	if err != nil {
-		t.Fatalf("query count error = %v", err)
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT reported_until FROM report_watermark WHERE ecosystem = ?", "npm").Scan(&got); err != nil {
+		t.Fatalf("scan: %v", err)
 	}
-
-	if count != 2 {
-		t.Errorf("reported_snapshot count = %d, want 2", count)
-	}
-
-	newEntries := []store.ReportRow{
-		{
-			ID:             "GHSA-test-3",
-			Ecosystem:      "Go",
-			Package:        "pkg3",
-			Published:      "2025-10-04T00:00:00Z",
-			Modified:       "2025-10-04T00:00:00Z",
-			SeverityVector: "",
-		},
-	}
-
-	if err := s.SaveReportSnapshot(ctx, newEntries); err != nil {
-		t.Fatalf("SaveReportSnapshot(2) error = %v", err)
-	}
-
-	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM reported_snapshot").Scan(&count)
-	if err != nil {
-		t.Fatalf("query count after replace error = %v", err)
-	}
-
-	if count != 1 {
-		t.Errorf("reported_snapshot count after replace = %d, want 1", count)
+	if got != 200 {
+		t.Errorf("monotonic guard regressed: watermark = %d, want 200", got)
 	}
 }
 
@@ -584,105 +623,172 @@ func TestSaveVulnerabilityWithAffected_PublishedNullSortsBeforeOnlyModified(t *t
 	}
 }
 
-func TestGetUnreportedVulnerabilities_MixedState_ReturnsModifiedAndNew(t *testing.T) {
+func TestDiff_EcosystemFilter_DoesNotResetOtherEcosystem(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	// Use a fixed UTC timestamp so the stored vuln.modified string matches the
-	// snapshot's modified string under the UTC-forcing write path.
-	unchangedModified := time.Date(2025, 10, 5, 12, 0, 0, 0, time.UTC)
+	clock := newTickingClock(time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC), time.Second)
+	store.SetStoreClockForTesting(s, clock.Now)
 
-	vuln1 := store.Vulnerability{
-		ID:                "GHSA-unchanged",
-		Modified:          unchangedModified,
-		Published:         time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC),
-		SeverityBaseScore: ptrFloat64(9.8),
-		SeverityVector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+	saveOne := func(id, eco string) {
+		v := store.Vulnerability{ID: id, Modified: clock.Now()}
+		if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: id, Ecosystem: eco, Package: id + "-pkg"}}); err != nil {
+			t.Fatalf("save %s/%s: %v", id, eco, err)
+		}
 	}
-	if err := s.SaveVulnerabilityWithAffected(ctx, vuln1,
-		[]store.Affected{{VulnID: vuln1.ID, Ecosystem: "npm", Package: "pkg-unchanged"}},
-	); err != nil {
-		t.Fatalf("save unchanged: %v", err)
-	}
+	saveOne("V-npm", "npm")
+	saveOne("V-pypi", "PyPI")
 
-	vuln2 := store.Vulnerability{
-		ID:                "GHSA-modified",
-		Modified:          time.Date(2025, 10, 3, 0, 0, 0, 0, time.UTC),
-		Published:         time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC),
-		SeverityBaseScore: ptrFloat64(6.4),
-		SeverityVector:    "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
-	}
-	if err := s.SaveVulnerabilityWithAffected(ctx, vuln2,
-		[]store.Affected{{VulnID: vuln2.ID, Ecosystem: "npm", Package: "pkg-modified"}},
-	); err != nil {
-		t.Fatalf("save modified: %v", err)
-	}
-
-	vuln3 := store.Vulnerability{
-		ID:        "GHSA-new",
-		Modified:  time.Now(),
-		Published: time.Date(2025, 10, 2, 0, 0, 0, 0, time.UTC),
-	}
-	if err := s.SaveVulnerabilityWithAffected(ctx, vuln3,
-		[]store.Affected{{VulnID: vuln3.ID, Ecosystem: "PyPI", Package: "pkg-new"}},
-	); err != nil {
-		t.Fatalf("save new: %v", err)
-	}
-
-	snapshot := []store.ReportRow{
-		{
-			ID:             "GHSA-unchanged",
-			Ecosystem:      "npm",
-			Package:        "pkg-unchanged",
-			Published:      "2025-10-01T00:00:00Z",
-			Modified:       unchangedModified.Format(time.RFC3339),
-			SeverityScore:  ptrFloat64(9.8),
-			SeverityVector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-		},
-		{
-			ID:             "GHSA-modified",
-			Ecosystem:      "npm",
-			Package:        "pkg-modified",
-			Published:      "2025-10-01T00:00:00Z",
-			Modified:       "2025-10-02T00:00:00Z",
-			SeverityScore:  ptrFloat64(6.4),
-			SeverityVector: "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
-		},
-	}
-	if err := s.SaveReportSnapshot(ctx, snapshot); err != nil {
-		t.Fatalf("SaveReportSnapshot() error = %v", err)
-	}
-
-	unreported, err := s.GetUnreportedVulnerabilities(ctx, "")
+	npmRows, err := s.GetUnreportedVulnerabilities(ctx, "npm")
 	if err != nil {
-		t.Fatalf("GetUnreportedVulnerabilities() error = %v", err)
+		t.Fatalf("GetUnreportedVulnerabilities(npm): %v", err)
+	}
+	if err := s.AdvanceWatermarks(ctx, npmRows); err != nil {
+		t.Fatalf("AdvanceWatermarks(npm): %v", err)
 	}
 
-	if len(unreported) != 2 {
-		t.Fatalf("GetUnreportedVulnerabilities() returned %d entries, want 2", len(unreported))
-	}
-
-	unreportedIDs := map[string]bool{unreported[0].ID: true, unreported[1].ID: true}
-	if !unreportedIDs["GHSA-modified"] {
-		t.Errorf("GetUnreportedVulnerabilities() did not return GHSA-modified, got %v", unreportedIDs)
-	}
-	if !unreportedIDs["GHSA-new"] {
-		t.Errorf("GetUnreportedVulnerabilities() did not return GHSA-new, got %v", unreportedIDs)
-	}
-	if unreportedIDs["GHSA-unchanged"] {
-		t.Errorf("GetUnreportedVulnerabilities() should not return GHSA-unchanged")
-	}
-
-	npmUnreported, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	pypiRows, err := s.GetUnreportedVulnerabilities(ctx, "PyPI")
 	if err != nil {
-		t.Fatalf("GetUnreportedVulnerabilities(npm) error = %v", err)
+		t.Fatalf("GetUnreportedVulnerabilities(PyPI): %v", err)
+	}
+	if len(pypiRows) != 1 {
+		t.Fatalf("PyPI watermark wiped by npm diff: got %d unreported, want 1", len(pypiRows))
+	}
+}
+
+func TestDiff_NoChange_EmitsZero(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	clock := newTickingClock(time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC), time.Second)
+	store.SetStoreClockForTesting(s, clock.Now)
+
+	v := store.Vulnerability{ID: "V-1", Modified: clock.Now()}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-1", Ecosystem: "npm", Package: "p1"}}); err != nil {
+		t.Fatalf("save: %v", err)
 	}
 
-	if len(npmUnreported) != 1 {
-		t.Fatalf("GetUnreportedVulnerabilities(npm) returned %d entries, want 1", len(npmUnreported))
+	first, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil {
+		t.Fatalf("first GetUnreported: %v", err)
+	}
+	if err := s.AdvanceWatermarks(ctx, first); err != nil {
+		t.Fatalf("AdvanceWatermarks: %v", err)
 	}
 
-	if npmUnreported[0].ID != "GHSA-modified" {
-		t.Errorf("GetUnreportedVulnerabilities(npm)[0].ID = %q, want GHSA-modified", npmUnreported[0].ID)
+	second, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil {
+		t.Fatalf("second GetUnreported: %v", err)
+	}
+	if len(second) != 0 {
+		t.Errorf("second diff returned %d rows, want 0", len(second))
+	}
+}
+
+func TestWatermark_FetchedAtSkewProtection(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	// Scenario: a record is reported (advancing watermark to fetched_at=T1)
+	// and then the SAME record is re-fetched later (fetched_at=T2 > T1) with
+	// a modified timestamp that is BEFORE the watermark in modified-space.
+	// Under a fetched_at-axis watermark the second fetch must surface again.
+	t0 := time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
+	clock := newTickingClock(t0, time.Hour)
+	store.SetStoreClockForTesting(s, clock.Now)
+
+	modifiedEarly := time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC) // before everything
+
+	v := store.Vulnerability{ID: "V-skew", Modified: modifiedEarly}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-skew", Ecosystem: "npm", Package: "p"}}); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	first, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first diff: rows=%d err=%v", len(first), err)
+	}
+	if err := s.AdvanceWatermarks(ctx, first); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	// Second save: same modified (still before watermark in modified-space),
+	// new fetched_at via the ticking clock.
+	if err := s.SaveVulnerabilityWithAffected(ctx, v, []store.Affected{{VulnID: "V-skew", Ecosystem: "npm", Package: "p"}}); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	second, err := s.GetUnreportedVulnerabilities(ctx, "npm")
+	if err != nil {
+		t.Fatalf("second diff err: %v", err)
+	}
+	if len(second) != 1 {
+		t.Errorf("re-fetched record should resurface on fetched_at axis: got %d rows, want 1", len(second))
+	}
+}
+
+func TestWatermarkMigration_DerivesFromExistingSnapshot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	// Pre-seed a database in the v2-shape (no fetched_at, with reported_snapshot)
+	// to simulate an upgrade. After migration the watermark must be populated
+	// from the snapshot so the first post-migration diff doesn't re-report
+	// everything.
+	seedLegacyDatabase(t, dbPath)
+
+	s, err := store.NewStore(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("NewStore on legacy DB: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	rows, err := s.GetUnreportedVulnerabilities(context.Background(), "npm")
+	if err != nil {
+		t.Fatalf("GetUnreportedVulnerabilities: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("first diff on migrated DB returned %d rows, expected 0 (watermark should be derived)", len(rows))
+	}
+}
+
+func TestGetUnreportedVulnerabilities_AfterAdvance_OnlyNewSurfaces(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	clock := newTickingClock(time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC), time.Second)
+	store.SetStoreClockForTesting(s, clock.Now)
+
+	// Save two rows under different ecosystems.
+	v1 := store.Vulnerability{ID: "V-a", Modified: time.Date(2025, 10, 2, 0, 0, 0, 0, time.UTC)}
+	v2 := store.Vulnerability{ID: "V-b", Modified: time.Date(2025, 10, 3, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v1, []store.Affected{{VulnID: v1.ID, Ecosystem: "npm", Package: "pkg-a"}}); err != nil {
+		t.Fatalf("save v1: %v", err)
+	}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v2, []store.Affected{{VulnID: v2.ID, Ecosystem: "PyPI", Package: "pkg-b"}}); err != nil {
+		t.Fatalf("save v2: %v", err)
+	}
+
+	// First diff covers both, then advance.
+	all, err := s.GetUnreportedVulnerabilities(ctx, "")
+	if err != nil {
+		t.Fatalf("first diff: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("first diff returned %d, want 2", len(all))
+	}
+	if err := s.AdvanceWatermarks(ctx, all); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	// A third row arrives; only it should surface in the next diff.
+	v3 := store.Vulnerability{ID: "V-c", Modified: time.Date(2025, 10, 4, 0, 0, 0, 0, time.UTC)}
+	if err := s.SaveVulnerabilityWithAffected(ctx, v3, []store.Affected{{VulnID: v3.ID, Ecosystem: "npm", Package: "pkg-c"}}); err != nil {
+		t.Fatalf("save v3: %v", err)
+	}
+
+	second, err := s.GetUnreportedVulnerabilities(ctx, "")
+	if err != nil {
+		t.Fatalf("second diff: %v", err)
+	}
+	if len(second) != 1 || second[0].ID != "V-c" {
+		t.Errorf("second diff = %+v, want only V-c", second)
 	}
 }

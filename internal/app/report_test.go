@@ -12,9 +12,9 @@ import (
 )
 
 type fakeReportStore struct {
-	rows           []store.ReportRow
-	unreportedRows []store.ReportRow
-	snapshotSaved  []store.ReportRow
+	rows               []store.ReportRow
+	unreportedRows     []store.ReportRow
+	watermarksAdvanced []store.ReportRow
 }
 
 func (f *fakeReportStore) GetVulnerabilitiesForReport(_ context.Context, _ string) ([]store.ReportRow, error) {
@@ -25,8 +25,8 @@ func (f *fakeReportStore) GetUnreportedVulnerabilities(_ context.Context, _ stri
 	return f.unreportedRows, nil
 }
 
-func (f *fakeReportStore) SaveReportSnapshot(_ context.Context, entries []store.ReportRow) error {
-	f.snapshotSaved = entries
+func (f *fakeReportStore) AdvanceWatermarks(_ context.Context, rows []store.ReportRow) error {
+	f.watermarksAdvanced = rows
 	return nil
 }
 
