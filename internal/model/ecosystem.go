@@ -44,16 +44,6 @@ func (e Ecosystem) String() string {
 	return string(e)
 }
 
-// ValidateWith checks if the ecosystem is present in the given allow list.
-func (e Ecosystem) ValidateWith(allowList []string) error {
-	for _, name := range allowList {
-		if string(e) == name {
-			return nil
-		}
-	}
-	return ErrInvalidEcosystem
-}
-
 // ValidateEcosystems checks that every ecosystem is present in the allow list.
 func ValidateEcosystems(ecosystems []Ecosystem, allowList []string) error {
 	set := make(map[string]struct{}, len(allowList))

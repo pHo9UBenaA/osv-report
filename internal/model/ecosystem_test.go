@@ -1,7 +1,6 @@
 package model_test
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/pHo9UBenaA/osv-report/internal/model"
@@ -63,46 +62,6 @@ func TestSitemapURL_EcosystemVariants(t *testing.T) {
 			got := tt.eco.SitemapURL()
 			if got != tt.wantURL {
 				t.Errorf("SitemapURL() = %q, want %q", got, tt.wantURL)
-			}
-		})
-	}
-}
-
-func TestValidateWith_EcosystemValidity(t *testing.T) {
-	allowList := []string{"npm", "PyPI", "GitHub Actions"}
-
-	cases := []struct {
-		name    string
-		eco     model.Ecosystem
-		wantErr error
-	}{
-		{
-			name:    "SupportedEcosystem_ReturnsNil",
-			eco:     model.NPM,
-			wantErr: nil,
-		},
-		{
-			name:    "UnsupportedName_ReturnsErrInvalidEcosystem",
-			eco:     model.Ecosystem("Unknown"),
-			wantErr: model.ErrInvalidEcosystem,
-		},
-		{
-			name:    "EcosystemWithSpace_ReturnsNil",
-			eco:     model.GitHubActions,
-			wantErr: nil,
-		},
-		{
-			name:    "EmptyString_ReturnsErrInvalidEcosystem",
-			eco:     model.Ecosystem(""),
-			wantErr: model.ErrInvalidEcosystem,
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.eco.ValidateWith(allowList)
-			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("ValidateWith() = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}

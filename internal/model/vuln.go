@@ -26,17 +26,6 @@ type Vulnerability struct {
 	Severity  []SeverityEntry
 }
 
-// FilterByCursor filters entries to only include those modified after the cursor time.
-func FilterByCursor(entries []Entry, cursor time.Time) []Entry {
-	var filtered []Entry
-	for _, e := range entries {
-		if e.Modified.After(cursor) {
-			filtered = append(filtered, e)
-		}
-	}
-	return filtered
-}
-
 // MaxModified returns the latest Modified time from the given entries.
 // Returns zero time if entries is empty.
 func MaxModified(entries []Entry) time.Time {

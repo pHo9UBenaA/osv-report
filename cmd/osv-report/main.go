@@ -75,9 +75,9 @@ func runReport() error {
 	ecosystem := reportCmd.String("ecosystem", "", "Filter report by ecosystem (empty = all)")
 	diff := reportCmd.Bool("diff", false, "Generate differential report (only new/changed vulnerabilities)")
 
-	if err := reportCmd.Parse(os.Args[2:]); err != nil {
-		return err
-	}
+	// reportCmd uses flag.ExitOnError, so Parse never returns an error;
+	// it exits the process on parse failure.
+	reportCmd.Parse(os.Args[2:]) //nolint:errcheck
 
 	ctx := context.Background()
 
