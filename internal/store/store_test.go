@@ -13,16 +13,22 @@ import (
 
 func ptrFloat64(v float64) *float64 { return &v }
 
-func TestNewStore_ForeignKeysEnabled(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
+// newTestStore creates a temp-dir SQLite store and registers Close as cleanup.
+// Returned dbPath lets callers open a second handle for direct SQL inspection.
+func newTestStore(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.NewStore(context.Background(), dbPath)
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	defer s.Close() //nolint:errcheck
+	t.Cleanup(func() { _ = s.Close() })
+	return s, dbPath
+}
+
+func TestNewStore_ForeignKeysEnabled(t *testing.T) {
+	_, dbPath := newTestStore(t)
+	ctx := context.Background()
 
 	// PRAGMA foreign_keys is per-connection in SQLite. Verify the driver-level
 	// DSN configuration applies the pragma to every pooled connection by
@@ -43,15 +49,7 @@ func TestNewStore_ForeignKeysEnabled(t *testing.T) {
 }
 
 func TestNewStore_ValidPath_CreatesDatabaseFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	ctx := context.Background()
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
+	_, dbPath := newTestStore(t)
 
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		t.Errorf("database file was not created at %s", dbPath)
@@ -59,15 +57,8 @@ func TestNewStore_ValidPath_CreatesDatabaseFile(t *testing.T) {
 }
 
 func TestSaveThenGetCursor_ReturnsSavedTimestamp(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	source := "test-ecosystem"
 	cursor := time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC)
@@ -87,15 +78,8 @@ func TestSaveThenGetCursor_ReturnsSavedTimestamp(t *testing.T) {
 }
 
 func TestGetCursor_ErrorConditions(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	t.Run("NonExistentSource_ReturnsNoRowsError", func(t *testing.T) {
 		_, err := s.GetCursor(ctx, "non-existent-source")
@@ -124,15 +108,8 @@ func TestGetCursor_ErrorConditions(t *testing.T) {
 }
 
 func TestSaveVulnerability_NewEntry_PersistsIdempotently(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vuln := store.Vulnerability{
 		ID:       "GHSA-xxxx-yyyy-zzzz",
@@ -149,15 +126,8 @@ func TestSaveVulnerability_NewEntry_PersistsIdempotently(t *testing.T) {
 }
 
 func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vulnID := "GHSA-severity-check"
 	modified := time.Date(2025, 10, 4, 12, 0, 0, 0, time.UTC)
@@ -209,15 +179,8 @@ func TestSaveVulnerability_NullThenUpdate_SeverityFieldsPersist(t *testing.T) {
 }
 
 func TestSaveVulnerability_WithSummaryAndDetails_PersistsAllFields(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vuln := store.Vulnerability{
 		ID:       "GHSA-detail-test",
@@ -251,15 +214,8 @@ func TestSaveVulnerability_WithSummaryAndDetails_PersistsAllFields(t *testing.T)
 }
 
 func TestNewStore_SchemaIndexes_ExistAfterCreation(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	_, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	db, err := sql.Open(store.DriverName, store.OpenDSN(dbPath))
 	if err != nil {
@@ -281,15 +237,8 @@ func TestNewStore_SchemaIndexes_ExistAfterCreation(t *testing.T) {
 }
 
 func TestSaveAffected_NewRecord_Persists(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vulnID := "GHSA-test-affected"
 	if err := s.SaveVulnerability(ctx, store.Vulnerability{
@@ -311,15 +260,8 @@ func TestSaveAffected_NewRecord_Persists(t *testing.T) {
 }
 
 func TestSaveTombstone_NewAndDuplicate_PersistsIdempotently(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	id := "GHSA-deleted-vuln"
 
@@ -333,15 +275,8 @@ func TestSaveTombstone_NewAndDuplicate_PersistsIdempotently(t *testing.T) {
 }
 
 func TestDeleteVulnerabilitiesOlderThan_MixedAges_RemovesOnlyOld(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	oldTime := time.Now().AddDate(0, 0, -14)
 	oldVuln := store.Vulnerability{
@@ -428,15 +363,8 @@ func TestDeleteVulnerabilitiesOlderThan_MixedAges_RemovesOnlyOld(t *testing.T) {
 }
 
 func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vuln1 := store.Vulnerability{
 		ID:                "GHSA-1234-5678-90ab",
@@ -511,15 +439,8 @@ func TestGetVulnerabilitiesForReport_MultipleEcosystems_FiltersCorrectly(t *test
 }
 
 func TestGetVulnerabilitiesForReport_DifferentDates_SortsByPublishedDescending(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	oldestPublished := time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
 	middlePublished := time.Date(2025, 10, 2, 0, 0, 0, 0, time.UTC)
@@ -570,15 +491,8 @@ func TestGetVulnerabilitiesForReport_DifferentDates_SortsByPublishedDescending(t
 }
 
 func TestSaveReportSnapshot_ReplaceExisting_ContainsOnlyNewEntries(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	entries := []store.ReportRow{
 		{
@@ -646,15 +560,8 @@ func TestSaveReportSnapshot_ReplaceExisting_ContainsOnlyNewEntries(t *testing.T)
 }
 
 func TestGetUnreportedVulnerabilities_MixedState_ReturnsModifiedAndNew(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
+	s, _ := newTestStore(t)
 	ctx := context.Background()
-
-	s, err := store.NewStore(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	defer s.Close() //nolint:errcheck
 
 	vuln1 := store.Vulnerability{
 		ID:                "GHSA-unchanged",
