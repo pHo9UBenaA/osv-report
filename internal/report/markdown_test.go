@@ -18,6 +18,30 @@ func formatMarkdown(t *testing.T, f *report.MarkdownFormatter, entries []report.
 	return buf.String()
 }
 
+func TestMarkdownFormatter_NewlineInCell_RendersAsBR(t *testing.T) {
+	// Newlines inside a Markdown table cell break the row layout — the
+	// formatter must escape them to <br>. The Replacer is ordered so
+	// CRLF maps to a single <br>, not two.
+	entries := []report.VulnerabilityEntry{
+		{ID: "id\nwith\nLF", Ecosystem: "eco\r\nwith\r\nCRLF", Package: "pkg\rwith\rCR"},
+	}
+	out := formatMarkdown(t, &report.MarkdownFormatter{}, entries)
+
+	if strings.Contains(out, "id\nwith") || strings.Contains(out, "with\rCR") {
+		t.Errorf("raw newlines leaked into output:\n%s", out)
+	}
+	if !strings.Contains(out, "id<br>with<br>LF") {
+		t.Errorf("LF not replaced with <br>: %s", out)
+	}
+	if !strings.Contains(out, "eco<br>with<br>CRLF") {
+		// CRLF should fold to one <br>, not two.
+		t.Errorf("CRLF should fold to single <br>: %s", out)
+	}
+	if !strings.Contains(out, "pkg<br>with<br>CR") {
+		t.Errorf("CR not replaced with <br>: %s", out)
+	}
+}
+
 func TestMarkdownFormatter_MixedEntries_ProducesTableWithNADefaults(t *testing.T) {
 	entries := []report.VulnerabilityEntry{
 		{
