@@ -78,7 +78,7 @@ func TestGenerateReport_Integration_OutputFileHasTimestamp(t *testing.T) {
 	}
 }
 
-func TestGenerateReport_Integration_DiffModeUpdatesSnapshot(t *testing.T) {
+func TestGenerateReport_Integration_DiffModeAdvancesWatermark(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	st := openTestStore(t, filepath.Join(tmpDir, "test.db"))

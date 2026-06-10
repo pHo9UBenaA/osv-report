@@ -17,7 +17,7 @@ osv-report/
 │   ├── app/             # Application orchestration (fetch, report)
 │   ├── config/          # Configuration management (env vars)
 │   ├── model/           # Domain models (Vulnerability, Ecosystem, CVSS)
-│   ├── osv/             # OSV API client & sitemap parser
+│   ├── osv/             # Unified all.zip Source (download + decode)
 │   ├── report/          # Report output (CSV, JSONL, Markdown)
 │   └── store/           # SQLite storage (database/sql + modernc.org/sqlite)
 ├── docs/                # Documentation

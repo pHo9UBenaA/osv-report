@@ -6,12 +6,10 @@ Decided — adopt **Candidate 1 (unified `all.zip`)**. Project takes **Phase F (
 
 ## Context
 
-The current fetch layer (sitemap + per-id API) carries the bulk of the open
+The pre-rev5 fetch layer (sitemap + per-id API) carried the bulk of the
 review findings (§1-2, §1-4, §1-5, §1-9 and the entire osv package polish).
 Phase 0-S is a half-day investigation spike to decide whether to repair that
-layer (Phase E) or replace it with a single zip download (Phase F). The plan
-(`~/.claude/plans/effervescent-doodling-globe.md` §Phase 0-S) gates Phase E
-vs Phase F on this memo's verdict; nothing else changes here.
+layer (Phase E) or replace it with a single zip download (Phase F).
 
 The driving questions: does the unified `all.zip` actually exist, does GCS
 honour conditional requests (so the second daily fetch is essentially free),
@@ -113,11 +111,59 @@ for 1.6 M IDs is tolerable but not free.
   via intermediate proxies in CI — the ETag round-trip itself is
   origin-served, but if a corporate proxy serves a cached body we lose the
   304 fast-path. Run a back-to-back fetch in CI to verify
-- Decide the on-disk staging strategy for a 1.17 GiB download: stream-zip
-  decode via `archive/zip` over an `io.ReaderAt` requires the full file;
-  consider writing to a temp file and `zip.OpenReader` rather than
-  buffering in RAM
-- The unified zip currently exposes ~32 % withdrawn records in the
-  AlmaLinux-heavy prefix sampled. Confirm the app-side ecosystem filter
-  drops these before they reach the store, otherwise we burn write
-  amplification on records we immediately re-delete
+
+## Operational notes (rev5)
+
+- `defaultAllZipHTTPTimeout` is 30 minutes. A 1.17 GiB body over a low-end
+  pipe (≈ 1 MB/s) just clears that window; raise the timeout via
+  `WithUnifiedHTTPClient` if a deployment routinely sees timeouts.
+- The download lands in `os.TempDir()`. On Linux distributions where
+  `/tmp` is a `tmpfs`, that means ~1.2 GiB of RAM until the iterator
+  closes. Set `TMPDIR` to the same directory as the SQLite database (or
+  any disk-backed mount) to keep RAM use bounded.
+- Past the rev5 state rewrite there is no `__unified__` literal in the
+  migrations. Migration v9 truncates `source_cursor` because the rev4
+  rows could be carrying silently-skipped state (bug #4) or an orphan
+  ETag (bug #1); the cost is one extra ~1.2 GiB download after upgrade.
+- `OSV_ECOSYSTEMS` changes are picked up automatically: the persisted
+  ecosystems fingerprint is compared with the configured set on every
+  run, and a mismatch forces a full refetch (cursor and ETag cleared)
+  so newly-subscribed ecosystems pick up historical records. Removing an
+  ecosystem also triggers a full refetch — the existing rows are not
+  deleted on the spot, so for the retention window the report still
+  shows the dropped ecosystem. This is an accepted trade-off; the
+  alternative is bespoke "diff the configured set" logic.
+
+### Tail-risk: a permanently undecodable record
+
+Strict-fail (`decodeFailures > 0 ⇒ state held, exit 1`) is the only
+safe response to a record we cannot decode — the failing record's
+modified is unknown so we cannot advance the cursor past it. The blast
+radius is the **whole OSV corpus** (~1.6 M records), not just the
+configured ecosystems, because `decodeZipEntry` runs before the
+ecosystem filter: an AlmaLinux record's schema drift halts an
+npm-only deployment. The upstream schema is strict enough that the
+realised rate is low (0-S sampled every record in npm / Go / unified
+and parsed cleanly), so we accept the tail rather than build an escape
+hatch in this rev.
+
+retention runs on every exit path after the state has loaded, so
+multi-day decode-failure outages drain the database to empty within
+the retention window. That follows from the freshness contract: data
+older than `OSV_DATA_RETENTION_DAYS` is out of scope by design, and
+preserving the last good snapshot past that window would defeat the
+contract. Treat a continuous decode failure as a P1.
+
+### Runbooks
+
+- **Repeated `N source events failed to decode` exit 1**: inspect the
+  `decode <file>.json` warning to identify the failing entry in the
+  zip. `DELETE FROM source_cursor` does NOT help here — the same zip
+  re-served from upstream will fail on the same entry. Either wait for
+  the OSV.dev fix (file an issue with the entry ID) or patch
+  `rawVulnerability` / `normalize` for the schema drift. Watch the
+  retention window: the DB empties at the cutoff.
+- **`get source state: parse cursor: ...` at startup**: external
+  tampering put a non-RFC3339 cursor value in `source_cursor`. Run
+  `DELETE FROM source_cursor WHERE source = '__unified__'` to clear it;
+  the next run does a full refetch.

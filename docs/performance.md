@@ -9,8 +9,10 @@ Fetch is dominated by one HTTP transaction:
 
 1. `GET https://osv-vulnerabilities.storage.googleapis.com/all.zip` with
    `If-None-Match: <prev ETag>`.
-2. If the server replies `304 Not Modified`, the fetch path returns
-   without doing any work other than the HEAD-equivalent round trip.
+2. If the server replies `304 Not Modified`, the fetch path skips
+   ingestion entirely. The cursor and ETag are kept as-is; the
+   retention DELETE still runs so freshness applies regardless of
+   whether new data arrived.
 3. Otherwise the body (~1.2 GiB as of 2026-06) streams into a temp
    file. The zip is then iterated record-by-record; each entry whose
    ecosystem intersects `OSV_ECOSYSTEMS` is upserted via the combined
