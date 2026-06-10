@@ -2,10 +2,9 @@
 
 ### Prerequisites
 
-- Go 1.24+
-- C compiler (CGo required by `mattn/go-sqlite3`)
-  - macOS: Xcode Command Line Tools (`xcode-select --install`)
-  - Linux: `gcc` or `build-essential`
+- Go 1.25+
+
+The project uses the pure-Go [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) driver, so no C compiler is required.
 
 ### Architecture
 
@@ -20,7 +19,7 @@ osv-report/
 │   ├── model/           # Domain models (Vulnerability, Ecosystem, CVSS)
 │   ├── osv/             # OSV API client & sitemap parser
 │   ├── report/          # Report output (CSV, JSONL, Markdown)
-│   └── store/           # SQLite storage (database/sql + mattn/go-sqlite3)
+│   └── store/           # SQLite storage (database/sql + modernc.org/sqlite)
 ├── docs/                # Documentation
 └── go.mod
 ```
