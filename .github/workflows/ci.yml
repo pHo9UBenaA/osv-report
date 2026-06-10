@@ -43,7 +43,7 @@ jobs:
           CGO_ENABLED: '0'
 
       - name: Run test
-        run: go test -shuffle=on ./...
+        run: go test -race -shuffle=on ./...
 
       - name: Check go mod tidy
         run: go mod tidy && git diff --exit-code go.mod go.sum
@@ -52,7 +52,9 @@ jobs:
         run: go mod verify
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Pinned version tag (not SHA, since `go install` is protected by the
+        # Go checksum database — module checksum verification covers integrity).
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
         env:
           GOTOOLCHAIN: auto
 
