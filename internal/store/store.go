@@ -160,7 +160,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		return fmt.Errorf("create schema: %w", err)
 	}
 
-	// Version-based migrations (B9: replaces fragile string matching)
+	// Version-based migrations
 	if err := s.runMigrations(ctx); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}

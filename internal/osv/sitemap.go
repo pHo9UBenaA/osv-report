@@ -15,7 +15,7 @@ import (
 const defaultSitemapHTTPTimeout = 30 * time.Second
 
 // vulnIDPattern extracts vulnerability IDs from sitemap URLs.
-// Compiled once at package level to avoid per-call overhead (B7).
+// Compiled once at package level to avoid per-call overhead.
 var vulnIDPattern = regexp.MustCompile(`/vulnerability/([A-Za-z0-9]+-[A-Za-z0-9-]+)`)
 
 // sitemapURL represents a URL entry in the sitemap.

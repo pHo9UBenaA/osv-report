@@ -25,8 +25,6 @@ func processEntries(ctx context.Context, client Client, st FetchStore, entries [
 }
 
 // processEntriesParallel fetches vulnerabilities in parallel with controlled concurrency.
-// B5: uses errgroup.SetLimit instead of manual semaphore.
-// B6: no loop variable capture needed (Go 1.22+).
 func processEntriesParallel(ctx context.Context, client Client, st FetchStore, entries []model.Entry, maxConcurrency int) error {
 	if maxConcurrency <= 0 {
 		return processEntries(ctx, client, st, entries)
